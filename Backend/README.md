@@ -3,8 +3,17 @@
 ## Run the ticket service
 
 ```bash
-cd ticket_service && uvicorn main:app --reload
+source venv/bin/activate
+uvicorn ticket_service.main:app --reload
 ```
+
+## Run the Billing Agent
+
+```bash
+source venv/bin/activate
+uvicorn complaint_agent.main:app --host 0.0.0.0 --port 8002 --reload
+```
+
 
 ## API Docs
 
