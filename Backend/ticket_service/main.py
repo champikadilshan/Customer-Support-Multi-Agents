@@ -4,11 +4,13 @@ from pydantic import BaseModel
 from datetime import datetime
 from enum import Enum
 from typing import Optional
+from pathlib import Path
 import uvicorn
 
 
 # Database Setup
-DATABASE_URL = "sqlite:///./tickets.db"
+DB_PATH = Path(__file__).resolve().parent / "tickets.db"
+DATABASE_URL = f"sqlite:///{DB_PATH}"
 engine = create_engine(DATABASE_URL, echo=False)
 
 def get_session():
