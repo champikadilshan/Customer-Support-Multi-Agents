@@ -6,17 +6,27 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, BaseMessage
 from typing import TypedDict, Annotated
 import operator
+import httpx
 
 import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
-from shared.config import COMPLAINT_AGENT_PORT
+from shared.config import COMPLAINT_AGENT_PORT, AGENT_HOST, TICKET_SERVICE_PORT
 from shared.llm import get_vertex_llm
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOLS
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# TICKET SERVICE URL — built from shared config, same pattern as AGENT_URLS
+# =============================================================================
+
+TICKET_SERVICE_URL = f"http://{AGENT_HOST}:{TICKET_SERVICE_PORT}"
+
+
+# =============================================================================
+# TOOLS — decorated with @tool so LLM can discover and call them
+# Each tool makes an HTTP call to the ticket_service instead of querying
+# the DB directly. categorize_complaint stays as pure keyword matching.
+# =============================================================================
 
 @tool
 def get_complaint_history(customer_id: str) -> list[dict]:
@@ -25,53 +35,55 @@ def get_complaint_history(customer_id: str) -> list[dict]:
     Use this when the user references a previous complaint, asks about
     the status of an existing issue, or wants to see their complaint history.
     """
-    # Simulated DB response
-    return [
-        {
-            "ticket_id":   "TKT-101",
-            "date":        "2024-06-10",
-            "subject":     "Wrong charge on invoice",
-            "status":      "Resolved",
-            "resolution":  "Credit of $20 applied to account",
-        },
-        {
-            "ticket_id":   "TKT-087",
-            "date":        "2024-04-22",
-            "subject":     "Service outage not compensated",
-            "status":      "Closed",
-            "resolution":  "1-month service credit issued",
-        },
-    ]
+    try:
+        response = httpx.get(
+            f"{TICKET_SERVICE_URL}/tickets/customer/{customer_id}",
+            timeout=10.0,
+        )
+
+        if response.status_code == 404:
+            return [{"error": f"No complaint history found for customer_id '{customer_id}'"}]
+
+        if response.status_code != 200:
+            return [{"error": f"Unexpected error from ticket service (status {response.status_code})"}]
+
+        return response.json()
+
+    except httpx.ConnectError:
+        return [{"error": "Ticket service is unavailable. Please try again later."}]
+    except httpx.TimeoutException:
+        return [{"error": "Ticket service request timed out. Please try again."}]
 
 
 @tool
-def get_ticket_status(ticket_id: str) -> dict:
+def get_ticket_status(ticket_id: int) -> dict:
     """
-    Retrieve the current status and details of a specific complaint ticket.
+    Retrieve the current status and full details of a specific complaint ticket.
     Use this when the user provides a ticket ID and wants an update,
     or when following up on a specific issue.
     """
-    # Simulated DB response
-    statuses = {
-        "TKT-101": {
-            "ticket_id":  "TKT-101",
-            "status":     "Resolved",
-            "assigned_to": "Agent Sarah",
-            "last_update": "2024-06-12",
-            "notes":       "Customer confirmed resolution on 2024-06-12",
-        },
-        "TKT-087": {
-            "ticket_id":  "TKT-087",
-            "status":     "Closed",
-            "assigned_to": "Agent Mike",
-            "last_update": "2024-04-30",
-            "notes":       "Service credit applied, case closed",
-        },
-    }
-    return statuses.get(
-        ticket_id,
-        {"ticket_id": ticket_id, "status": "Not Found", "notes": "No ticket with this ID exists"},
-    )
+    try:
+        response = httpx.get(
+            f"{TICKET_SERVICE_URL}/tickets/{ticket_id}",
+            timeout=10.0,
+        )
+
+        if response.status_code == 404:
+            return {
+                "ticket_id": ticket_id,
+                "status":    "Not Found",
+                "error":     f"No ticket found with ID {ticket_id}",
+            }
+
+        if response.status_code != 200:
+            return {"error": f"Unexpected error from ticket service (status {response.status_code})"}
+
+        return response.json()
+
+    except httpx.ConnectError:
+        return {"error": "Ticket service is unavailable. Please try again later."}
+    except httpx.TimeoutException:
+        return {"error": "Ticket service request timed out. Please try again."}
 
 
 @tool
@@ -84,8 +96,7 @@ def categorize_complaint(description: str) -> dict:
     Categories: billing_dispute, service_outage, product_defect,
                 refund_request, rude_staff, delivery_issue, other.
     """
-    # In production this could be another LLM call or a classifier model.
-    # Here we use simple keyword matching as a simulation.
+    # Keyword matching classifier — no DB, no HTTP needed
     description_lower = description.lower()
 
     if any(w in description_lower for w in ["charge", "invoice", "overcharged", "billed"]):
@@ -118,9 +129,10 @@ def categorize_complaint(description: str) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # LANGGRAPH STATE
-# ══════════════════════════════════════════════════════════════════════════════
+# messages uses operator.add so each node appends rather than overwrites
+# =============================================================================
 
 class ComplaintState(TypedDict):
     request_id:     str
@@ -129,9 +141,9 @@ class ComplaintState(TypedDict):
     final_response: str
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # LLM — bind all tools
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 TOOLS = [get_complaint_history, get_ticket_status, categorize_complaint]
 
@@ -139,9 +151,9 @@ llm = get_vertex_llm(temperature=0)
 llm_with_tools = llm.bind_tools(TOOLS)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # NODES
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def agent_node(state: ComplaintState) -> ComplaintState:
     """
@@ -184,26 +196,27 @@ def format_response_node(state: ComplaintState) -> ComplaintState:
     return {**state, "final_response": final}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # BUILD GRAPH
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def build_complaint_graph() -> CompiledStateGraph:
     """
     Graph shape:
-                    START
-                      │
-                  agent_node  ◄──────────────┐
-                      │                       │
-          tools_condition (conditional edge)  │
-              ┌─────┴─────┐                  │
-           "tools"    "end"                  │
-              │            │                  │
-          tool_node    format_response        │
-              │            │                  │
-              └────────────┘──────────────────┘
-                            │
-                           END
+
+                START
+                  |
+              agent_node  <--------------+
+                  |                      |
+      tools_condition (conditional edge) |
+          +-------+-------+             |
+       "tools"         END              |
+          |              |              |
+       tool_node    format_response     |
+          |              |              |
+          +--------------+--------------+
+                         |
+                        END
     """
     graph = StateGraph(ComplaintState)
 
@@ -228,9 +241,9 @@ def build_complaint_graph() -> CompiledStateGraph:
     return graph.compile()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # FASTAPI — A2A endpoint
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 app = FastAPI(title="Complaint Agent", version="1.0")
 complaint_graph: CompiledStateGraph = build_complaint_graph()
@@ -240,6 +253,8 @@ complaint_graph: CompiledStateGraph = build_complaint_graph()
 async def process(req: A2ARequest) -> A2AResponse:
     """
     A2A entry point — called by the Intent Detector orchestrator.
+    Receives an A2ARequest, runs the complaint ReAct graph,
+    returns an A2AResponse.
     """
     initial_state: ComplaintState = {
         "request_id":     req.request_id,
