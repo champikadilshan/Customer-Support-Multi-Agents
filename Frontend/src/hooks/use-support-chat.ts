@@ -3,6 +3,7 @@
 import { useCallback, useRef, useState } from "react"
 
 import { type Message } from "@/components/ui/chat-message"
+import { refreshTicketsPanel } from "@/hooks/use-tickets"
 import { consumeSseStream, type SseEvent } from "@/lib/sse"
 
 export type HitlRequest = {
@@ -140,6 +141,7 @@ export function useSupportChat() {
               toolInvocations: completedTools,
             }
           })
+          refreshTicketsPanel()
           break
       }
     },

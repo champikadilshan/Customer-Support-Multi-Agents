@@ -7,6 +7,7 @@ import {
 import { SiteFooter } from "@/components/layout/site-footer"
 import { SiteHeader } from "@/components/layout/site-header"
 import { SupportChat } from "@/components/support/support-chat"
+import { TicketsPanel } from "@/components/support/tickets-panel"
 import { Button } from "@/components/ui/button"
 
 export default function Home() {
@@ -37,10 +38,9 @@ export default function Home() {
             </section>
           </div>
 
-          <aside
-            aria-label="Tickets panel"
-            className="hidden px-4 md:block"
-          />
+          <aside aria-label="Tickets panel" className="mt-12 hidden px-4 md:block">
+            <TicketsPanel />
+          </aside>
         </div>
       </main>
       <SiteFooter />
