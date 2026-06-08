@@ -1,10 +1,12 @@
+import json
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, BaseMessage
-from typing import TypedDict, Annotated
+from typing import TypedDict, Annotated, AsyncIterator
 import operator
 import httpx
 
@@ -96,7 +98,6 @@ def categorize_complaint(description: str) -> dict:
     Categories: billing_dispute, service_outage, product_defect,
                 refund_request, rude_staff, delivery_issue, other.
     """
-    # Keyword matching classifier — no DB, no HTTP needed
     description_lower = description.lower()
 
     if any(w in description_lower for w in ["charge", "invoice", "overcharged", "billed"]):
@@ -185,6 +186,7 @@ def agent_node(state: ComplaintState) -> ComplaintState:
 def format_response_node(state: ComplaintState) -> ComplaintState:
     """
     Extracts the final AI answer after the ReAct loop completes.
+    Still used by the non-streaming /process endpoint.
     """
     for msg in reversed(state["messages"]):
         if hasattr(msg, "content") and msg.content:
@@ -242,19 +244,150 @@ def build_complaint_graph() -> CompiledStateGraph:
 
 
 # =============================================================================
-# FASTAPI — A2A endpoint
+# SSE HELPERS
+# =============================================================================
+
+def _sse(event: str, data: dict) -> str:
+    """
+    Format a single SSE frame.
+    The double newline at the end is required by the SSE spec —
+    it signals the end of one event to the client.
+
+    Example output:
+        event: tool_call
+        data: {"tool": "get_complaint_history"}
+
+    """
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def stream_complaint_graph(
+    req: A2ARequest,
+    graph: CompiledStateGraph,
+) -> AsyncIterator[str]:
+    """
+    Async generator that runs the complaint LangGraph via astream_events
+    and yields SSE-formatted strings.
+
+    Event types emitted:
+      - tool_call : fired when the LLM decides to invoke a tool.
+                    Particularly meaningful here because two tools make
+                    outbound HTTP calls to the ticket service — the user
+                    will notice the pause, so surfacing the tool name lets
+                    the UI show "Checking your ticket history…" etc.
+      - token     : fired for every text chunk the LLM streams.
+                    Carries {"text": "<chunk>"}.
+      - done      : fired once after the graph finishes.
+                    Carries request_id, agent name, and status.
+      - error     : fired if an exception is raised mid-stream.
+                    Carries {"message": "<error text>"}.
+
+    Tool execution order for a typical new complaint:
+      on_tool_start → categorize_complaint   (instant, keyword matching)
+      on_tool_start → get_complaint_history  (slow, hits ticket service over HTTP)
+      on_chat_model_stream → token … token … token
+      done
+    """
+    initial_state: ComplaintState = {
+        "request_id":     req.request_id,
+        "user_message":   req.user_message,
+        "messages":       [HumanMessage(content=req.user_message)],
+        "final_response": "",
+    }
+
+    try:
+        async for event in graph.astream_events(initial_state, version="v2"):
+            kind = event["event"]
+
+            # ── Tool invocation ──────────────────────────────────────────────
+            # Fired once per tool call, before the tool actually executes.
+            # For get_complaint_history and get_ticket_status this is especially
+            # useful — they block on HTTP so the UI can show a status hint
+            # while the ticket service responds.
+            if kind == "on_tool_start":
+                tool_name = event.get("name", "unknown_tool")
+                yield _sse("tool_call", {"tool": tool_name})
+
+            # ── Streaming LLM tokens ─────────────────────────────────────────
+            # on_chat_model_stream fires once per token chunk.
+            # We only forward chunks that contain actual text — not the
+            # tool-call scaffolding frames which have empty or list content.
+            elif kind == "on_chat_model_stream":
+                chunk = event["data"].get("chunk")
+                if chunk is None:
+                    continue
+
+                # AIMessageChunk.content is a string for plain text tokens
+                # and a list of dicts when the model is mid-tool-call.
+                # Only forward plain text.
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    yield _sse("token", {"text": content})
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text:
+                                yield _sse("token", {"text": text})
+
+        # ── Completion ───────────────────────────────────────────────────────
+        yield _sse("done", {
+            "request_id": req.request_id,
+            "agent":      AgentType.COMPLAINT.value,
+            "status":     "success",
+        })
+
+    except Exception as exc:
+        # Surface the error as an SSE event so the orchestrator can handle
+        # it gracefully rather than seeing a broken stream with no explanation.
+        yield _sse("error", {"message": str(exc)})
+
+
+# =============================================================================
+# FASTAPI
 # =============================================================================
 
 app = FastAPI(title="Complaint Agent", version="1.0")
 complaint_graph: CompiledStateGraph = build_complaint_graph()
 
 
+# -----------------------------------------------------------------------------
+# NEW — streaming endpoint
+# The orchestrator calls this and reads the SSE stream token by token.
+# Response has no response_model because it is a raw stream, not a JSON body.
+# -----------------------------------------------------------------------------
+@app.post("/process/stream")
+async def process_stream(req: A2ARequest) -> StreamingResponse:
+    """
+    Streaming A2A endpoint.
+    Runs the complaint ReAct graph and pushes SSE events as they happen:
+      - tool_call events when a tool is about to execute
+            (especially useful for the HTTP-bound ticket service tools)
+      - token     events for each LLM output chunk
+      - done      event when the graph finishes
+      - error     event on failure
+
+    The caller must read the response as a stream (not buffer it).
+    Content-Type is text/event-stream.
+    """
+    return StreamingResponse(
+        stream_complaint_graph(req, complaint_graph),
+        media_type="text/event-stream",
+        # X-Accel-Buffering: no tells nginx not to buffer chunks.
+        headers={"X-Accel-Buffering": "no"},
+    )
+
+
+# -----------------------------------------------------------------------------
+# KEPT — original blocking endpoint
+# Still available so the orchestrator can fall back to non-streaming mode
+# during a migration, or for callers that don't support SSE.
+# -----------------------------------------------------------------------------
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
     """
-    A2A entry point — called by the Intent Detector orchestrator.
-    Receives an A2ARequest, runs the complaint ReAct graph,
-    returns an A2AResponse.
+    Original blocking A2A endpoint — unchanged.
+    Runs the full graph and returns a single A2AResponse JSON body.
     """
     initial_state: ComplaintState = {
         "request_id":     req.request_id,
