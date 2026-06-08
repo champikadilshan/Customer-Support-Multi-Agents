@@ -4,9 +4,11 @@ from fastapi.responses import StreamingResponse
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, BaseMessage
-from typing import TypedDict, Annotated, AsyncIterator
+from typing import TypedDict, Annotated, AsyncIterator, Optional, Literal
+from pydantic import BaseModel
 import operator
 import httpx
 
@@ -21,7 +23,10 @@ TICKET_SERVICE_URL = f"http://{AGENT_HOST}:{TICKET_SERVICE_PORT}"
 
 
 # =============================================================================
-# TOOLS
+# TOOLS  (bound to the LLM — read-only operations)
+# create_ticket is intentionally NOT in this list — the LLM never calls it
+# directly. It is invoked manually inside create_ticket_node after HITL
+# approval, so the human always gates the write operation.
 # =============================================================================
 
 @tool
@@ -116,22 +121,55 @@ def categorize_complaint(description: str) -> dict:
     }
 
 
+@tool
+def stage_ticket_creation(
+    title:       str,
+    description: str,
+    customer_id: str,
+    category:    str,
+    priority:    str,
+) -> dict:
+    """
+    Stage a new support ticket for creation — does NOT create it yet.
+    Use this when you have fully understood the customer's complaint and
+    want to raise a ticket on their behalf.
+    The ticket will only be created after the customer confirms.
+    Always call categorize_complaint first so category and priority are accurate.
+    """
+    # This tool only stores intent — actual creation happens in
+    # create_ticket_node after HITL approval.
+    return {
+        "staged":      True,
+        "title":       title,
+        "description": description,
+        "customer_id": customer_id,
+        "category":    category,
+        "priority":    priority,
+    }
+
+
 # =============================================================================
 # LANGGRAPH STATE
 # =============================================================================
 
 class ComplaintState(TypedDict):
-    request_id:     str
-    user_message:   str
-    messages:       Annotated[list[BaseMessage], operator.add]
-    final_response: str
+    request_id:          str
+    user_message:        str
+    messages:            Annotated[list[BaseMessage], operator.add]
+    final_response:      str
+    # ── HITL fields ──────────────────────────────────────────────────────────
+    hitl_pending:        bool             # True while waiting for human response
+    hitl_response:       str              # "yes" | "no" — filled on resume
+    pending_ticket_data: Optional[dict]   # staged ticket payload
 
 
 # =============================================================================
 # LLM
 # =============================================================================
 
-TOOLS = [get_complaint_history, get_ticket_status, categorize_complaint]
+# stage_ticket_creation IS in TOOLS so the LLM can call it to signal intent.
+# The actual POST to the ticket service happens only after HITL approval.
+TOOLS = [get_complaint_history, get_ticket_status, categorize_complaint, stage_ticket_creation]
 
 llm = get_vertex_llm(temperature=0)
 llm_with_tools = llm.bind_tools(TOOLS)
@@ -146,9 +184,18 @@ def agent_node(state: ComplaintState) -> ComplaintState:
         "You are a compassionate complaint resolution agent. "
         "Your goal is to understand the customer's issue, acknowledge their frustration, "
         "and provide a clear next step or resolution. "
-        "Use the available tools to look up complaint history and categorize issues. "
         "Use customer_id 'CUST-001' as default if not provided by the user. "
-        "Always be empathetic, professional, and solution-focused."
+        "\n\n"
+        "STRICT RULES — follow these exactly:\n"
+        "1. When a customer describes a new complaint or problem, you MUST:\n"
+        "   a. First call categorize_complaint to get the category and priority.\n"
+        "   b. Then immediately call stage_ticket_creation with those details.\n"
+        "   Do NOT describe what you are going to do. Do NOT ask for confirmation in text. "
+        "   Just call the tools. The system will handle confirmation with the user.\n"
+        "2. NEVER say 'I will stage a ticket' or 'I am preparing a ticket' — "
+        "   just call stage_ticket_creation directly.\n"
+        "3. For status checks or history lookups, use get_ticket_status or get_complaint_history.\n"
+        "4. Always be empathetic and professional in your final response."
     )
 
     messages_with_system = [
@@ -158,6 +205,95 @@ def agent_node(state: ComplaintState) -> ComplaintState:
 
     response = llm_with_tools.invoke(messages_with_system)
     return {"messages": [response]}
+
+
+def hitl_checkpoint_node(state: ComplaintState) -> ComplaintState:
+    """
+    Extracts the staged ticket data from the last stage_ticket_creation
+    tool call result and suspends the graph for human approval.
+
+    This node is listed in interrupt_before at graph compile time — LangGraph
+    will pause execution here and wait for graph.update_state() + graph.invoke()
+    to be called from the /process/resume endpoint.
+    """
+    # Walk back through messages to find the stage_ticket_creation tool result
+    pending = None
+    for msg in reversed(state["messages"]):
+        # ToolMessage carries the tool result as a dict in .content (parsed)
+        if hasattr(msg, "name") and msg.name == "stage_ticket_creation":
+            try:
+                content = msg.content
+                if isinstance(content, str):
+                    content = json.loads(content)
+                if isinstance(content, dict) and content.get("staged"):
+                    pending = content
+                    break
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    return {
+        **state,
+        "hitl_pending":        True,
+        "pending_ticket_data": pending,
+    }
+
+
+def hitl_resume_node(state: ComplaintState) -> ComplaintState:
+    """
+    Clears the HITL pending flag after the human has responded.
+    The actual routing (yes → create_ticket, no → format_response)
+    is handled by the conditional edge that follows this node.
+    """
+    return {
+        **state,
+        "hitl_pending": False,
+    }
+
+
+def create_ticket_node(state: ComplaintState) -> ComplaintState:
+    """
+    Called only after the human approved ticket creation.
+    POSTs to the ticket service and stores the result in messages
+    so format_response_node can reference the ticket ID.
+    """
+    data = state.get("pending_ticket_data") or {}
+
+    try:
+        response = httpx.post(
+            f"{TICKET_SERVICE_URL}/tickets",
+            json={
+                "title":       data.get("title",       "Support Ticket"),
+                "description": data.get("description", state["user_message"]),
+                "customer_id": data.get("customer_id", "CUST-001"),
+                "category":    data.get("category"),
+                "priority":    data.get("priority"),
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        ticket = response.json()
+
+        # Inject a synthetic human message so the agent can reference ticket ID
+        confirmation_text = (
+            f"Ticket #{ticket['id']} has been successfully created. "
+            f"Title: {ticket['title']}. "
+            f"Category: {ticket.get('category', 'N/A')}. "
+            f"Priority: {ticket.get('priority', 'N/A')}. "
+            f"Status: {ticket['status']}."
+        )
+
+    except httpx.ConnectError:
+        confirmation_text = "I tried to create your ticket but the ticket service is currently unavailable. Please try again later."
+    except httpx.TimeoutException:
+        confirmation_text = "I tried to create your ticket but the request timed out. Please try again."
+    except httpx.HTTPStatusError as e:
+        confirmation_text = f"I tried to create your ticket but received an error (status {e.response.status_code}). Please try again."
+
+    # Store confirmation as a HumanMessage so format_response_node picks it up
+    return {
+        **state,
+        "messages": [HumanMessage(content=confirmation_text)],
+    }
 
 
 def format_response_node(state: ComplaintState) -> ComplaintState:
@@ -171,19 +307,86 @@ def format_response_node(state: ComplaintState) -> ComplaintState:
     return {**state, "final_response": final}
 
 
+def ticket_declined_node(state: ComplaintState) -> ComplaintState:
+    """Sets a friendly final response when the user declined ticket creation."""
+    return {
+        **state,
+        "final_response": (
+            "Understood — I won't raise a ticket for now. "
+            "If you change your mind or need anything else, feel free to ask."
+        ),
+    }
+
+
+# =============================================================================
+# CONDITIONAL EDGES
+# =============================================================================
+
+def after_tools_condition(state: ComplaintState) -> Literal["hitl_checkpoint", "agent"]:
+    """
+    After the ToolNode runs, check if the last tool called was
+    stage_ticket_creation. If yes, divert to HITL. Otherwise loop
+    back to the agent as normal.
+    """
+    messages = state.get("messages", [])
+    for msg in reversed(messages):
+        if hasattr(msg, "name") and msg.name == "stage_ticket_creation":
+            return "hitl_checkpoint"
+    return "agent"
+
+
+def after_hitl_resume_condition(state: ComplaintState) -> Literal["create_ticket", "ticket_declined"]:
+    """Route based on the human's yes/no response."""
+    response = (state.get("hitl_response") or "").strip().lower()
+    if response in ("yes", "y", "confirm", "ok", "sure"):
+        return "create_ticket"
+    return "ticket_declined"
+
+
 # =============================================================================
 # BUILD GRAPH
 # =============================================================================
 
-def build_complaint_graph() -> CompiledStateGraph:
+def build_complaint_graph(checkpointer: InMemorySaver) -> CompiledStateGraph:
+    """
+    Graph shape:
+
+        START
+          |
+        agent ──(tools_condition)──► tools
+          ▲                            |
+          └──(after_tools_condition)───┤
+                  "agent"              |
+                                       └──(after_tools_condition)──► hitl_checkpoint
+                                                                            |
+                                                                     [INTERRUPT HERE]
+                                                                            |
+                                                                      hitl_resume
+                                                                            |
+                                              ┌─────────────────────────────┘
+                                    "create_ticket"              "ticket_declined"
+                                          |                             |
+                                   create_ticket_node          ticket_declined_node
+                                          |                             |
+                                   format_response ◄───────────────────┘
+                                          |
+                                         END
+
+    agent ──(tools_condition END)──► format_response ──► END
+    """
     graph = StateGraph(ComplaintState)
 
-    graph.add_node("agent",           agent_node)
-    graph.add_node("tools",           ToolNode(TOOLS))
-    graph.add_node("format_response", format_response_node)
+    graph.add_node("agent",            agent_node)
+    graph.add_node("tools",            ToolNode(TOOLS))
+    graph.add_node("hitl_checkpoint",  hitl_checkpoint_node)
+    graph.add_node("hitl_resume",      hitl_resume_node)
+    graph.add_node("create_ticket",    create_ticket_node)
+    graph.add_node("ticket_declined",  ticket_declined_node)
+    graph.add_node("format_response",  format_response_node)
 
     graph.set_entry_point("agent")
 
+    # agent → tools OR format_response (standard tools_condition)
     graph.add_conditional_edges(
         "agent",
         tools_condition,
@@ -193,10 +396,40 @@ def build_complaint_graph() -> CompiledStateGraph:
         },
     )
 
-    graph.add_edge("tools",           "agent")
+    # tools → hitl_checkpoint (if stage_ticket_creation was called) OR back to agent
+    graph.add_conditional_edges(
+        "tools",
+        after_tools_condition,
+        {
+            "hitl_checkpoint": "hitl_checkpoint",
+            "agent":           "agent",
+        },
+    )
+
+    # hitl_checkpoint suspends here (interrupt_before in compile())
+    graph.add_edge("hitl_checkpoint", "hitl_resume")
+
+    # hitl_resume → create_ticket OR ticket_declined
+    graph.add_conditional_edges(
+        "hitl_resume",
+        after_hitl_resume_condition,
+        {
+            "create_ticket":   "create_ticket",
+            "ticket_declined": "ticket_declined",
+        },
+    )
+
+    graph.add_edge("create_ticket",   "format_response")
+    graph.add_edge("ticket_declined", END)
     graph.add_edge("format_response", END)
 
-    return graph.compile()
+    return graph.compile(
+        checkpointer=checkpointer,
+        # Pause execution just before hitl_resume so the human can respond.
+        # When /process/resume calls graph.update_state() + graph.invoke(None),
+        # execution picks up from hitl_resume with hitl_response already set.
+        interrupt_before=["hitl_resume"],
+    )
 
 
 # =============================================================================
@@ -220,7 +453,7 @@ def _extract_text(content) -> str:
 
 
 # =============================================================================
-# STREAMING GENERATOR
+# STREAMING GENERATOR — initial request
 # =============================================================================
 
 async def stream_complaint_graph(
@@ -230,27 +463,37 @@ async def stream_complaint_graph(
     """
     Runs the complaint LangGraph via astream_events and yields SSE strings.
 
-    Filters on_chain_stream to format_response node only — that node's
-    chunk is always {"final_response": "..."} which is the clean AI answer.
-    All other nodes (tools, agent) are ignored to prevent raw tool result
-    JSON leaking as token events.
+    If the graph reaches hitl_checkpoint, execution is automatically
+    suspended by LangGraph (interrupt_before=["hitl_resume"]).
+    We detect this by checking the graph's current node after streaming ends —
+    if it stopped at hitl_resume, we emit a hitl_request SSE event so the
+    client knows to show the confirmation UI.
     """
+    # thread_id = request_id so resume calls can find the right checkpoint
+    config = {"configurable": {"thread_id": req.request_id}}
+
     initial_state: ComplaintState = {
-        "request_id":     req.request_id,
-        "user_message":   req.user_message,
-        "messages":       [HumanMessage(content=req.user_message)],
-        "final_response": "",
+        "request_id":          req.request_id,
+        "user_message":        req.user_message,
+        "messages":            [HumanMessage(content=req.user_message)],
+        "final_response":      "",
+        "hitl_pending":        False,
+        "hitl_response":       "",
+        "pending_ticket_data": None,
     }
 
     try:
-        async for event in graph.astream_events(initial_state, version="v2"):
+        async for event in graph.astream_events(initial_state, config, version="v2"):
             kind = event["event"]
             name = event.get("name", "")
 
             # ── Tool invocation ──────────────────────────────────────────────
             if kind == "on_tool_start":
                 tool_name = event.get("name", "unknown_tool")
-                yield _sse("tool_call", {"tool": tool_name})
+                # Don't surface stage_ticket_creation — it's an internal
+                # signal, not a user-visible operation.
+                if tool_name != "stage_ticket_creation":
+                    yield _sse("tool_call", {"tool": tool_name})
 
             # ── Token-by-token streaming (OpenAI / future Vertex) ────────────
             elif kind == "on_chat_model_stream":
@@ -262,7 +505,6 @@ async def stream_complaint_graph(
                     yield _sse("token", {"text": text})
 
             # ── Full response in one shot (current Vertex AI behaviour) ──────
-            # format_response node chunk: {"final_response": "..."}
             elif kind == "on_chain_stream" and name == "format_response":
                 chunk = event.get("data", {}).get("chunk")
                 if not isinstance(chunk, dict):
@@ -271,9 +513,98 @@ async def stream_complaint_graph(
                 if isinstance(text, str) and text:
                     yield _sse("token", {"text": text})
 
-        # ── Completion ───────────────────────────────────────────────────────
+        # ── After streaming: check if graph suspended for HITL ───────────────
+        snapshot = graph.get_state(config)
+
+        if snapshot.next and "hitl_resume" in snapshot.next:
+            # Graph is suspended — send HITL request event to the client
+            ticket = snapshot.values.get("pending_ticket_data") or {}
+            yield _sse("hitl_request", {
+                "request_id": req.request_id,
+                "question":   (
+                    f"I'd like to raise a support ticket on your behalf:\n\n"
+                    f"  Title:    {ticket.get('title', 'Support Ticket')}\n"
+                    f"  Category: {ticket.get('category', 'N/A')}\n"
+                    f"  Priority: {ticket.get('priority', 'N/A')}\n\n"
+                    f"Shall I go ahead and create it?"
+                ),
+                "ticket_preview": {
+                    "title":    ticket.get("title"),
+                    "category": ticket.get("category"),
+                    "priority": ticket.get("priority"),
+                },
+                "options": ["Yes, raise it", "No, skip it"],
+            })
+        else:
+            # Graph ran to completion normally
+            yield _sse("done", {
+                "request_id": req.request_id,
+                "agent":      AgentType.COMPLAINT.value,
+                "status":     "success",
+            })
+
+    except Exception as exc:
+        yield _sse("error", {"message": str(exc)})
+
+
+# =============================================================================
+# STREAMING GENERATOR — resume after HITL
+# =============================================================================
+
+async def stream_complaint_resume(
+    request_id:    str,
+    hitl_response: str,
+    graph:         CompiledStateGraph,
+) -> AsyncIterator[str]:
+    """
+    Resumes a suspended complaint graph after the human has responded.
+
+    1. Injects hitl_response into the checkpointed state.
+    2. Calls graph.astream_events(None, config) — passing None as input
+       tells LangGraph to resume from the checkpoint rather than start fresh.
+    3. Streams the remainder of the graph (create_ticket or ticket_declined
+       → format_response) as normal SSE events.
+    """
+    config = {"configurable": {"thread_id": request_id}}
+
+    # Inject the human's answer into the saved state
+    graph.update_state(config, {"hitl_response": hitl_response})
+
+    try:
+        # None input = resume from checkpoint
+        async for event in graph.astream_events(None, config, version="v2"):
+            kind = event["event"]
+            name = event.get("name", "")
+
+            if kind == "on_tool_start":
+                yield _sse("tool_call", {"tool": event.get("name", "unknown_tool")})
+
+            elif kind == "on_chat_model_stream":
+                chunk = event["data"].get("chunk")
+                if chunk is None:
+                    continue
+                text = _extract_text(chunk.content)
+                if text:
+                    yield _sse("token", {"text": text})
+
+            elif kind == "on_chain_stream" and name == "format_response":
+                chunk = event.get("data", {}).get("chunk")
+                if not isinstance(chunk, dict):
+                    continue
+                text = chunk.get("final_response", "")
+                if isinstance(text, str) and text:
+                    yield _sse("token", {"text": text})
+
+            elif kind == "on_chain_stream" and name == "ticket_declined":
+                chunk = event.get("data", {}).get("chunk")
+                if not isinstance(chunk, dict):
+                    continue
+                text = chunk.get("final_response", "")
+                if isinstance(text, str) and text:
+                    yield _sse("token", {"text": text})
+
         yield _sse("done", {
-            "request_id": req.request_id,
+            "request_id": request_id,
             "agent":      AgentType.COMPLAINT.value,
             "status":     "success",
         })
@@ -287,9 +618,24 @@ async def stream_complaint_graph(
 # =============================================================================
 
 app = FastAPI(title="Complaint Agent", version="1.0")
-complaint_graph: CompiledStateGraph = build_complaint_graph()
+
+# InMemorySaver holds all checkpoints in RAM.
+# Replace with SqliteSaver or RedisSaver for persistence across restarts.
+checkpointer    = InMemorySaver()
+complaint_graph = build_complaint_graph(checkpointer)
 
 
+# -----------------------------------------------------------------------------
+# Request body for the resume endpoint
+# -----------------------------------------------------------------------------
+class ResumeRequest(BaseModel):
+    request_id:    str
+    hitl_response: str   # "yes" | "no"
+
+
+# -----------------------------------------------------------------------------
+# Existing streaming endpoint — unchanged contract, new HITL-aware internals
+# -----------------------------------------------------------------------------
 @app.post("/process/stream")
 async def process_stream(req: A2ARequest) -> StreamingResponse:
     return StreamingResponse(
@@ -299,16 +645,84 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
     )
 
 
+# -----------------------------------------------------------------------------
+# NEW — resume endpoint
+# Called by the client after the user responds to a hitl_request event.
+# Returns a streaming response that continues from where the graph paused.
+# -----------------------------------------------------------------------------
+@app.post("/process/resume")
+async def process_resume(body: ResumeRequest) -> StreamingResponse:
+    """
+    Resume a suspended complaint graph after human approval/rejection.
+
+    Expects: { "request_id": "...", "hitl_response": "yes" | "no" }
+
+    Emits the same SSE event types as /process/stream:
+      event: tool_call  — if create_ticket_node fires any sub-tools
+      event: token      — LLM response chunks
+      event: done       — graph completed
+      event: error      — something went wrong
+    """
+    # Validate that a checkpoint exists for this request_id
+    config   = {"configurable": {"thread_id": body.request_id}}
+    snapshot = complaint_graph.get_state(config)
+
+    if not snapshot or not snapshot.next:
+        async def not_found():
+            yield _sse("error", {
+                "message": f"No suspended graph found for request_id '{body.request_id}'. "
+                           f"It may have already completed or never existed."
+            })
+        return StreamingResponse(
+            not_found(),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no"},
+        )
+
+    return StreamingResponse(
+        stream_complaint_resume(body.request_id, body.hitl_response, complaint_graph),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no"},
+    )
+
+
+# -----------------------------------------------------------------------------
+# Existing blocking endpoint — updated to handle HITL state gracefully
+# -----------------------------------------------------------------------------
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
+    config = {"configurable": {"thread_id": req.request_id}}
+
     initial_state: ComplaintState = {
-        "request_id":     req.request_id,
-        "user_message":   req.user_message,
-        "messages":       [HumanMessage(content=req.user_message)],
-        "final_response": "",
+        "request_id":          req.request_id,
+        "user_message":        req.user_message,
+        "messages":            [HumanMessage(content=req.user_message)],
+        "final_response":      "",
+        "hitl_pending":        False,
+        "hitl_response":       "",
+        "pending_ticket_data": None,
     }
 
-    result = await complaint_graph.ainvoke(initial_state)
+    result = await complaint_graph.ainvoke(initial_state, config)
+
+    # If the graph suspended for HITL, surface that in the response
+    if result.get("hitl_pending"):
+        ticket = result.get("pending_ticket_data") or {}
+        return A2AResponse(
+            request_id=req.request_id,
+            source_agent=AgentType.COMPLAINT,
+            status="hitl_pending",
+            result=(
+                f"A ticket is ready to be raised: "
+                f"{ticket.get('title')} ({ticket.get('category')}, {ticket.get('priority')}). "
+                f"Call POST /process/resume with hitl_response 'yes' or 'no' to continue."
+            ),
+            metadata={
+                "tools_available": [t.name for t in TOOLS],
+                "hitl_pending":    True,
+                "ticket_preview":  ticket,
+            },
+        )
 
     return A2AResponse(
         request_id=req.request_id,
