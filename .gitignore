@@ -3,7 +3,11 @@ venv/
 .venv/
 env/
 ENV/
-Backend/.env
+
+# Environment variables
+.env
+.env.*
+!.env.example
 
 # Local SQLite database
 tickets.db
