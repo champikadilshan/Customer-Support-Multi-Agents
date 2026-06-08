@@ -54,6 +54,14 @@ set -a && source .env && set +a
 uvicorn sales_agent.main:app --port $SALES_AGENT_PORT
 ```
 
+## Sales Mcp Server
+
+```bash
+source venv/bin/activate
+set -a && source .env && set +a
+uvicorn sales_agent.mcp_server:app --port $SALES_MCP_PORT
+```
+
 ## API docs
 
 - Ticket service: http://localhost:8000/docs
