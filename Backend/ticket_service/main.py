@@ -108,4 +108,14 @@ def update_ticket_status( ticket_id: int, payload: TicketStatusUpdate, session: 
 
 # Entry Point
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from shared.config import TICKET_SERVICE_PORT
+
+    uvicorn.run(
+        "ticket_service.main:app",
+        host="0.0.0.0",
+        port=TICKET_SERVICE_PORT,
+        reload=True,
+    )
