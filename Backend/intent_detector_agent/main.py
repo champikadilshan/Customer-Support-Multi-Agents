@@ -14,21 +14,30 @@ from shared.llm import get_vertex_llm
 VALID_INTENTS = {"billing", "complaint", "sales"}
 
 
-# ── LangGraph state ──────────────────────────────────────────────────────────
+# =============================================================================
+# LANGGRAPH STATE
+# =============================================================================
+
 class OrchestratorState(TypedDict):
-    user_message: str
+    user_message:    str
     detected_intent: str        # "billing" | "complaint" | "sales" | "unknown"
-    target_agent: AgentType
-    a2a_response: str
-    request_id: str
-    final_response: str
+    target_agent:    AgentType
+    a2a_response:    str
+    request_id:      str
+    final_response:  str
 
 
-# ── LLM setup ────────────────────────────────────────────────────────────────
+# =============================================================================
+# LLM
+# =============================================================================
+
 llm = get_vertex_llm(temperature=0)
 
 
-# ── Node 1: Detect intent ────────────────────────────────────────────────────
+# =============================================================================
+# NODE 1 — Detect intent
+# =============================================================================
+
 def detect_intent_node(state: OrchestratorState) -> OrchestratorState:
     """
     Uses LLM to classify the user message into one of:
@@ -61,16 +70,20 @@ def detect_intent_node(state: OrchestratorState) -> OrchestratorState:
     return {
         **state,
         "detected_intent": intent,
-        "target_agent": agent_map.get(intent, AgentType.BILLING),
-        "request_id": str(uuid.uuid4()),
+        "target_agent":    agent_map.get(intent, AgentType.BILLING),
+        "request_id":      str(uuid.uuid4()),
     }
 
 
-# ── Node 2: Dispatch to specialist agent via A2A HTTP call ───────────────────
+# =============================================================================
+# NODE 2 — Dispatch to specialist agent via A2A HTTP call
+# =============================================================================
+
 async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
     """
     Builds an A2ARequest and POSTs it to the correct specialist agent.
     Waits for A2AResponse and stores the result.
+    Handles downstream failures gracefully so the orchestrator never crashes.
     """
     req = A2ARequest(
         request_id=state["request_id"],
@@ -80,23 +93,53 @@ async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
         context={"detected_intent": state["detected_intent"]},
     )
 
-    async with httpx.AsyncClient() as client:
-        url = AGENT_URLS[state["target_agent"]]
-        response = await client.post(
-            url,
-            json=req.model_dump(),
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        a2a_resp = A2AResponse(**response.json())
+    try:
+        async with httpx.AsyncClient() as client:
+            url = AGENT_URLS[state["target_agent"]]
+            response = await client.post(
+                url,
+                json=req.model_dump(),
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            a2a_resp = A2AResponse(**response.json())
+            return {**state, "a2a_response": a2a_resp.result}
 
-    return {
-        **state,
-        "a2a_response": a2a_resp.result,
-    }
+    except httpx.ConnectError:
+        agent_name = state["target_agent"].value
+        return {
+            **state,
+            "a2a_response": (
+                f"The {agent_name} agent is currently unavailable. "
+                f"Please try again later."
+            ),
+        }
+
+    except httpx.TimeoutException:
+        agent_name = state["target_agent"].value
+        return {
+            **state,
+            "a2a_response": (
+                f"The {agent_name} agent took too long to respond. "
+                f"Please try again."
+            ),
+        }
+
+    except httpx.HTTPStatusError as e:
+        agent_name = state["target_agent"].value
+        return {
+            **state,
+            "a2a_response": (
+                f"The {agent_name} agent returned an error "
+                f"(status {e.response.status_code}). Please try again."
+            ),
+        }
 
 
-# ── Node 3: Format final response back to the user ───────────────────────────
+# =============================================================================
+# NODE 3 — Format final response back to the user
+# =============================================================================
+
 def format_response_node(state: OrchestratorState) -> OrchestratorState:
     """
     Cleans and structures the final reply to the end user.
@@ -113,7 +156,10 @@ def format_response_node(state: OrchestratorState) -> OrchestratorState:
     return {**state, "final_response": final}
 
 
-# ── Fallback node for unknown intents ─────────────────────────────────────────
+# =============================================================================
+# FALLBACK NODE — unknown intent
+# =============================================================================
+
 def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
     return {
         **state,
@@ -124,27 +170,48 @@ def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
     }
 
 
-# ── Conditional edge: route based on detected intent ─────────────────────────
+# =============================================================================
+# CONDITIONAL EDGE — route based on detected intent
+# =============================================================================
+
 def route_intent(state: OrchestratorState) -> Literal["dispatch", "unknown_intent"]:
     if state["detected_intent"] in VALID_INTENTS:
         return "dispatch"
     return "unknown_intent"
 
 
-# ── Build the LangGraph ───────────────────────────────────────────────────────
+# =============================================================================
+# BUILD GRAPH
+# =============================================================================
+
 def build_orchestrator_graph() -> CompiledStateGraph:
+    """
+    Graph shape:
+
+                        START
+                          |
+                   detect_intent_node
+                          |
+              conditional edge (route_intent)
+                 +--------+--------+
+                 |                 |
+            "dispatch"      "unknown_intent"
+                 |                 |
+       dispatch_to_agent       unknown_intent_node
+                 |                 |
+        format_response_node      END
+                 |
+                END
+    """
     graph = StateGraph(OrchestratorState)
 
-    # Register nodes
     graph.add_node("detect_intent",   detect_intent_node)
     graph.add_node("dispatch",        dispatch_to_agent_node)
     graph.add_node("format_response", format_response_node)
     graph.add_node("unknown_intent",  unknown_intent_node)
 
-    # Entry point
     graph.set_entry_point("detect_intent")
 
-    # Conditional routing after intent detection
     graph.add_conditional_edges(
         "detect_intent",
         route_intent,
@@ -154,17 +221,17 @@ def build_orchestrator_graph() -> CompiledStateGraph:
         },
     )
 
-    # Happy path
     graph.add_edge("dispatch",        "format_response")
     graph.add_edge("format_response", END)
-
-    # Fallback path
-    graph.add_edge("unknown_intent", END)
+    graph.add_edge("unknown_intent",  END)
 
     return graph.compile()
 
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+# =============================================================================
+# FASTAPI — entry point for all user messages
+# =============================================================================
+
 app = FastAPI(title="Intent Detector — Orchestrator", version="1.0")
 orchestrator: CompiledStateGraph = build_orchestrator_graph()
 
@@ -174,15 +241,15 @@ async def chat(payload: dict) -> dict:
     """
     Entry point for all user messages.
     Expects: { "message": "..." }
-    Returns: { "intent": "...", "agent": "...", "response": "..." }
+    Returns: { "intent": "...", "agent": "...", "request_id": "...", "response": "..." }
     """
     initial_state: OrchestratorState = {
-        "user_message":     payload["message"],
-        "detected_intent":  "",
-        "target_agent":     AgentType.BILLING,   # placeholder, overwritten by detect_intent_node
-        "a2a_response":     "",
-        "request_id":       "",
-        "final_response":   "",
+        "user_message":    payload["message"],
+        "detected_intent": "",
+        "target_agent":    AgentType.BILLING,  # placeholder, overwritten by detect_intent_node
+        "a2a_response":    "",
+        "request_id":      "",
+        "final_response":  "",
     }
 
     result = await orchestrator.ainvoke(initial_state)
@@ -197,14 +264,14 @@ async def chat(payload: dict) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "agent": "intent_detector_agent"}
+    return {"status": "ok", "agent": "intent_detector"}
 
 
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "intent_detector_agent.main:app",
+        "intent_detector.main:app",
         host="0.0.0.0",
         port=INTENT_DETECTOR_PORT,
         reload=True,
