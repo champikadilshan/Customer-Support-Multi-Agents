@@ -3,6 +3,7 @@ venv/
 .venv/
 env/
 ENV/
+Backend/.env
 
 # Local SQLite database
 tickets.db
