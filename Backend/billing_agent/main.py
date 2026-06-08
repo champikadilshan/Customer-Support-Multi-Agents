@@ -1,10 +1,12 @@
+import json
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, BaseMessage
-from typing import TypedDict, Annotated
+from typing import TypedDict, Annotated, AsyncIterator
 import operator
 
 import sys, os
@@ -32,7 +34,9 @@ def get_account_balance(account_id: str) -> dict:
     or when their next payment is due.
     """
     with get_session() as session:
-        row = session.exec( select(AccountBalance).where(AccountBalance.account_id == account_id) ).first()
+        row = session.exec(
+            select(AccountBalance).where(AccountBalance.account_id == account_id)
+        ).first()
 
     if not row:
         return {"error": f"No account found for account_id '{account_id}'"}
@@ -83,7 +87,9 @@ def get_payment_methods(account_id: str) -> dict:
     or wants to know how they can pay.
     """
     with get_session() as session:
-        rows = session.exec( select(PaymentMethod).where(PaymentMethod.account_id == account_id) ).all()
+        rows = session.exec(
+            select(PaymentMethod).where(PaymentMethod.account_id == account_id)
+        ).all()
 
     if not rows:
         return {"error": f"No payment methods found for account_id '{account_id}'"}
@@ -148,7 +154,6 @@ def agent_node(state: BillingState) -> BillingState:
         "has not provided one. Always be concise and professional."
     )
 
-    # Prepend system context to messages
     messages_with_system = [
         {"role": "system", "content": system_prompt},
         *state["messages"],
@@ -162,8 +167,8 @@ def format_response_node(state: BillingState) -> BillingState:
     """
     Extracts the last AI message (the final answer after all tool calls)
     and stores it as final_response for A2AResponse wrapping.
+    Still used by the non-streaming /process endpoint.
     """
-    # Walk backwards to find the last non-tool-call AI message
     for msg in reversed(state["messages"]):
         if hasattr(msg, "content") and msg.content:
             final = msg.content
@@ -179,44 +184,23 @@ def format_response_node(state: BillingState) -> BillingState:
 # =============================================================================
 
 def build_billing_graph() -> CompiledStateGraph:
-    """
-    Graph shape:
-
-                START
-                  |
-              agent_node  <--------------+
-                  |                      |
-      tools_condition (conditional edge) |
-          +-------+-------+             |
-       "tools"         END              |
-          |              |              |
-       tool_node    format_response     |
-          |              |              |
-          +--------------+--------------+
-                         |
-                        END
-    """
     graph = StateGraph(BillingState)
 
-    # Register nodes
     graph.add_node("agent",           agent_node)
     graph.add_node("tools",           ToolNode(TOOLS))
     graph.add_node("format_response", format_response_node)
 
-    # Entry
     graph.set_entry_point("agent")
 
-    # Conditional: did LLM call a tool or produce a final answer?
     graph.add_conditional_edges(
         "agent",
-        tools_condition,          # built-in: checks for tool_calls in last message
+        tools_condition,
         {
-            "tools": "tools",           # LLM wants to call a tool
-            END:     "format_response", # LLM produced final answer
+            "tools": "tools",
+            END:     "format_response",
         },
     )
 
-    # After tool executes, loop back to agent so LLM can reason over the result
     graph.add_edge("tools",           "agent")
     graph.add_edge("format_response", END)
 
@@ -224,7 +208,99 @@ def build_billing_graph() -> CompiledStateGraph:
 
 
 # =============================================================================
-# FASTAPI — A2A endpoint
+# SSE HELPERS
+# =============================================================================
+
+def _sse(event: str, data: dict) -> str:
+    """
+    Format a single SSE frame.
+    The double newline at the end is required by the SSE spec —
+    it signals the end of one event to the client.
+
+    Example output:
+        event: token
+        data: {"text": "Your balance"}
+
+    """
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def stream_billing_graph(
+    req: A2ARequest,
+    graph: CompiledStateGraph,
+) -> AsyncIterator[str]:
+    """
+    Async generator that runs the billing LangGraph via astream_events
+    and yields SSE-formatted strings.
+
+    Event types emitted:
+      - tool_call : fired when the LLM decides to invoke a tool.
+                    Carries the tool name so the caller can show
+                    a status hint like "Looking up your balance…"
+      - token     : fired for every text chunk the LLM streams.
+                    Carries {"text": "<chunk>"}.
+      - done      : fired once after the graph finishes.
+                    Carries request_id, agent name, and status.
+      - error     : fired if an exception is raised mid-stream.
+                    Carries {"message": "<error text>"}.
+    """
+    initial_state: BillingState = {
+        "request_id":     req.request_id,
+        "user_message":   req.user_message,
+        "messages":       [HumanMessage(content=req.user_message)],
+        "final_response": "",
+    }
+
+    try:
+        async for event in graph.astream_events(initial_state, version="v2"):
+            kind = event["event"]
+
+            # ── Tool invocation ──────────────────────────────────────────────
+            # Fired once per tool call, before the tool actually runs.
+            # We surface the tool name so the orchestrator / UI can display
+            # a "working…" indicator.
+            if kind == "on_tool_start":
+                tool_name = event.get("name", "unknown_tool")
+                yield _sse("tool_call", {"tool": tool_name})
+
+            # ── Streaming LLM tokens ─────────────────────────────────────────
+            # on_chat_model_stream fires once per token chunk.
+            # We only forward chunks that contain actual text (not tool-call
+            # scaffolding, which has no .content or empty .content).
+            elif kind == "on_chat_model_stream":
+                chunk = event["data"].get("chunk")
+                if chunk is None:
+                    continue
+
+                # AIMessageChunk.content can be a string or a list of dicts
+                # (the list form appears when the model is mid-tool-call).
+                # We only want plain text chunks.
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    yield _sse("token", {"text": content})
+                elif isinstance(content, list):
+                    # Extract text from list-form content blocks
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text:
+                                yield _sse("token", {"text": text})
+
+        # ── Completion ───────────────────────────────────────────────────────
+        yield _sse("done", {
+            "request_id": req.request_id,
+            "agent":      AgentType.BILLING.value,
+            "status":     "success",
+        })
+
+    except Exception as exc:
+        # Surface the error as an SSE event so the orchestrator can handle
+        # it gracefully rather than seeing a broken stream with no explanation.
+        yield _sse("error", {"message": str(exc)})
+
+
+# =============================================================================
+# FASTAPI
 # =============================================================================
 
 app = FastAPI(title="Billing Agent", version="1.0")
@@ -237,12 +313,43 @@ def on_startup():
     create_db_and_tables()
 
 
+# -----------------------------------------------------------------------------
+# NEW — streaming endpoint
+# The orchestrator calls this and reads the SSE stream token by token.
+# Response has no response_model because it is a raw stream, not a JSON body.
+# -----------------------------------------------------------------------------
+@app.post("/process/stream")
+async def process_stream(req: A2ARequest) -> StreamingResponse:
+    """
+    Streaming A2A endpoint.
+    Runs the billing ReAct graph and pushes SSE events as they happen:
+      - tool_call events when a DB lookup starts
+      - token     events for each LLM output chunk
+      - done      event when the graph finishes
+      - error     event on failure
+
+    The caller must read the response as a stream (not buffer it).
+    Content-Type is text/event-stream.
+    """
+    return StreamingResponse(
+        stream_billing_graph(req, billing_graph),
+        media_type="text/event-stream",
+        # Disable buffering proxies / nginx would otherwise apply.
+        # X-Accel-Buffering: no tells nginx to pass chunks straight through.
+        headers={"X-Accel-Buffering": "no"},
+    )
+
+
+# -----------------------------------------------------------------------------
+# KEPT — original blocking endpoint
+# Still available so the orchestrator can fall back to non-streaming mode
+# during a migration, or for callers that don't support SSE.
+# -----------------------------------------------------------------------------
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
     """
-    A2A entry point — called by the Intent Detector orchestrator.
-    Receives an A2ARequest, runs the billing ReAct graph,
-    returns an A2AResponse.
+    Original blocking A2A endpoint — unchanged.
+    Runs the full graph and returns a single A2AResponse JSON body.
     """
     initial_state: BillingState = {
         "request_id":     req.request_id,
