@@ -103,9 +103,9 @@ def format_response_node(state: OrchestratorState) -> OrchestratorState:
     Adds a small prefix showing which agent handled the request.
     """
     agent_label = {
-        AgentType.BILLING:   "💳 Billing Support",
-        AgentType.COMPLAINT: "📋 Complaint Support",
-        AgentType.SALES:     "🛍️  Sales Support",
+        AgentType.BILLING:   "Billing Support",
+        AgentType.COMPLAINT: "Complaint Support",
+        AgentType.SALES:     "Sales Support",
     }.get(state["target_agent"], "Support")
 
     final = f"[{agent_label}]\n\n{state['a2a_response']}"
