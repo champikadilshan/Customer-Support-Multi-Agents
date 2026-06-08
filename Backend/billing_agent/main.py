@@ -12,11 +12,16 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import BILLING_AGENT_PORT
 from shared.llm import get_vertex_llm
+from billing_agent.database import create_db_and_tables, get_session
+from billing_agent.models import AccountBalance, Invoice, PaymentMethod
+from sqlmodel import select
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOLS  — decorated with @tool so LLM can discover and call them
-# In production, replace the simulated data with real DB / API calls
-# ══════════════════════════════════════════════════════════════════════════════
+
+# =============================================================================
+# TOOLS — decorated with @tool so LLM can discover and call them
+# Each tool opens its own DB session, queries SQLite, returns a dict/list.
+# The docstring is what the LLM reads to decide when to call the tool.
+# =============================================================================
 
 @tool
 def get_account_balance(account_id: str) -> dict:
@@ -26,13 +31,18 @@ def get_account_balance(account_id: str) -> dict:
     Use this when the user asks about their balance, how much they owe,
     or when their next payment is due.
     """
-    # Simulated DB response
+    with get_session() as session:
+        row = session.exec( select(AccountBalance).where(AccountBalance.account_id == account_id) ).first()
+
+    if not row:
+        return {"error": f"No account found for account_id '{account_id}'"}
+
     return {
-        "account_id":    account_id,
-        "balance_due":   "$245.00",
-        "due_date":      "2024-07-15",
-        "payment_status": "Pending",
-        "last_payment":  "$245.00 on 2024-06-15",
+        "account_id":     row.account_id,
+        "balance_due":    row.balance_due,
+        "due_date":       row.due_date,
+        "payment_status": row.payment_status,
+        "last_payment":   row.last_payment,
     }
 
 
@@ -43,13 +53,25 @@ def get_invoice_history(account_id: str) -> list[dict]:
     Use this when the user asks about past invoices, billing history,
     or wants to see previous charges.
     """
-    # Simulated DB response
+    with get_session() as session:
+        rows = session.exec(
+            select(Invoice)
+            .where(Invoice.account_id == account_id)
+            .order_by(Invoice.date.desc())
+            .limit(5)
+        ).all()
+
+    if not rows:
+        return [{"error": f"No invoices found for account_id '{account_id}'"}]
+
     return [
-        {"invoice_id": "INV-001", "date": "2024-06-01", "amount": "$245.00", "status": "Paid"},
-        {"invoice_id": "INV-002", "date": "2024-05-01", "amount": "$245.00", "status": "Paid"},
-        {"invoice_id": "INV-003", "date": "2024-04-01", "amount": "$220.00", "status": "Paid"},
-        {"invoice_id": "INV-004", "date": "2024-03-01", "amount": "$220.00", "status": "Paid"},
-        {"invoice_id": "INV-005", "date": "2024-02-01", "amount": "$200.00", "status": "Paid"},
+        {
+            "invoice_id": row.invoice_id,
+            "date":       row.date,
+            "amount":     row.amount,
+            "status":     row.status,
+        }
+        for row in rows
     ]
 
 
@@ -60,20 +82,35 @@ def get_payment_methods(account_id: str) -> dict:
     Use this when the user asks about their saved cards, bank accounts,
     or wants to know how they can pay.
     """
-    # Simulated DB response
+    with get_session() as session:
+        rows = session.exec( select(PaymentMethod).where(PaymentMethod.account_id == account_id) ).all()
+
+    if not rows:
+        return {"error": f"No payment methods found for account_id '{account_id}'"}
+
+    methods = []
+    for row in rows:
+        entry = {
+            "type":    row.type,
+            "last4":   row.last4,
+            "default": row.is_default,
+        }
+        if row.expiry:       # cards have expiry
+            entry["expiry"] = row.expiry
+        if row.bank:         # bank accounts have bank name
+            entry["bank"]   = row.bank
+        methods.append(entry)
+
     return {
-        "account_id": account_id,
-        "payment_methods": [
-            {"type": "Visa",        "last4": "4242", "expiry": "12/26", "default": True},
-            {"type": "Bank Account","last4": "9876", "bank":   "Chase",  "default": False},
-        ],
+        "account_id":      account_id,
+        "payment_methods": methods,
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # LANGGRAPH STATE
 # messages uses operator.add so each node appends rather than overwrites
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 class BillingState(TypedDict):
     request_id:     str
@@ -82,9 +119,9 @@ class BillingState(TypedDict):
     final_response: str
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # LLM — bind all tools so LLM knows it can call them
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 TOOLS = [get_account_balance, get_invoice_history, get_payment_methods]
 
@@ -92,17 +129,17 @@ llm = get_vertex_llm(temperature=0)
 llm_with_tools = llm.bind_tools(TOOLS)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # NODES
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def agent_node(state: BillingState) -> BillingState:
     """
     Core ReAct node.
     The LLM receives the conversation so far (including any tool results)
     and either:
-      (a) calls one of the tools  → ToolNode will execute it next
-      (b) produces a final answer → graph moves to format_response
+      (a) calls one of the tools  -> ToolNode will execute it next
+      (b) produces a final answer -> graph moves to format_response
     """
     system_prompt = (
         "You are a helpful billing support agent. "
@@ -137,26 +174,27 @@ def format_response_node(state: BillingState) -> BillingState:
     return {**state, "final_response": final}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # BUILD GRAPH
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def build_billing_graph() -> CompiledStateGraph:
     """
     Graph shape:
-                    START
-                      │
-                  agent_node  ◄──────────────┐
-                      │                       │
-          tools_condition (conditional edge)  │
-              ┌─────┴─────┐                  │
-           "tools"    "end"                  │
-              │            │                  │
-          tool_node    format_response        │
-              │            │                  │
-              └────────────┘──────────────────┘
-                            │
-                           END
+
+                START
+                  |
+              agent_node  <--------------+
+                  |                      |
+      tools_condition (conditional edge) |
+          +-------+-------+             |
+       "tools"         END              |
+          |              |              |
+       tool_node    format_response     |
+          |              |              |
+          +--------------+--------------+
+                         |
+                        END
     """
     graph = StateGraph(BillingState)
 
@@ -173,8 +211,8 @@ def build_billing_graph() -> CompiledStateGraph:
         "agent",
         tools_condition,          # built-in: checks for tool_calls in last message
         {
-            "tools": "tools",     # LLM wants to call a tool
-            END:     "format_response",  # LLM produced final answer
+            "tools": "tools",           # LLM wants to call a tool
+            END:     "format_response", # LLM produced final answer
         },
     )
 
@@ -185,12 +223,18 @@ def build_billing_graph() -> CompiledStateGraph:
     return graph.compile()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # FASTAPI — A2A endpoint
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 app = FastAPI(title="Billing Agent", version="1.0")
 billing_graph: CompiledStateGraph = build_billing_graph()
+
+
+@app.on_event("startup")
+def on_startup():
+    """Create DB tables on first run. Safe to call on every restart."""
+    create_db_and_tables()
 
 
 @app.post("/process", response_model=A2AResponse)
