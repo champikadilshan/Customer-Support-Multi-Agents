@@ -20,9 +20,7 @@ from sqlmodel import select
 
 
 # =============================================================================
-# TOOLS — decorated with @tool so LLM can discover and call them
-# Each tool opens its own DB session, queries SQLite, returns a dict/list.
-# The docstring is what the LLM reads to decide when to call the tool.
+# TOOLS
 # =============================================================================
 
 @tool
@@ -101,10 +99,10 @@ def get_payment_methods(account_id: str) -> dict:
             "last4":   row.last4,
             "default": row.is_default,
         }
-        if row.expiry:       # cards have expiry
+        if row.expiry:
             entry["expiry"] = row.expiry
-        if row.bank:         # bank accounts have bank name
-            entry["bank"]   = row.bank
+        if row.bank:
+            entry["bank"] = row.bank
         methods.append(entry)
 
     return {
@@ -115,7 +113,6 @@ def get_payment_methods(account_id: str) -> dict:
 
 # =============================================================================
 # LANGGRAPH STATE
-# messages uses operator.add so each node appends rather than overwrites
 # =============================================================================
 
 class BillingState(TypedDict):
@@ -126,7 +123,7 @@ class BillingState(TypedDict):
 
 
 # =============================================================================
-# LLM — bind all tools so LLM knows it can call them
+# LLM
 # =============================================================================
 
 TOOLS = [get_account_balance, get_invoice_history, get_payment_methods]
@@ -140,13 +137,6 @@ llm_with_tools = llm.bind_tools(TOOLS)
 # =============================================================================
 
 def agent_node(state: BillingState) -> BillingState:
-    """
-    Core ReAct node.
-    The LLM receives the conversation so far (including any tool results)
-    and either:
-      (a) calls one of the tools  -> ToolNode will execute it next
-      (b) produces a final answer -> graph moves to format_response
-    """
     system_prompt = (
         "You are a helpful billing support agent. "
         "Use the available tools to look up account information when needed. "
@@ -164,11 +154,6 @@ def agent_node(state: BillingState) -> BillingState:
 
 
 def format_response_node(state: BillingState) -> BillingState:
-    """
-    Extracts the last AI message (the final answer after all tool calls)
-    and stores it as final_response for A2AResponse wrapping.
-    Still used by the non-streaming /process endpoint.
-    """
     for msg in reversed(state["messages"]):
         if hasattr(msg, "content") and msg.content:
             final = msg.content
@@ -208,41 +193,52 @@ def build_billing_graph() -> CompiledStateGraph:
 
 
 # =============================================================================
-# SSE HELPERS
+# SSE HELPER
 # =============================================================================
 
 def _sse(event: str, data: dict) -> str:
-    """
-    Format a single SSE frame.
-    The double newline at the end is required by the SSE spec —
-    it signals the end of one event to the client.
-
-    Example output:
-        event: token
-        data: {"text": "Your balance"}
-
-    """
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
+
+def _extract_text(content) -> str:
+    """
+    Safely pull a plain text string out of whatever content shape
+    Vertex AI returns. Handles three forms:
+      1. Plain string              → return as-is
+      2. List of content blocks   → join all "text" typed blocks
+      3. Anything else            → return empty string
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "".join(parts)
+    return ""
+
+
+# =============================================================================
+# STREAMING GENERATOR
+# =============================================================================
 
 async def stream_billing_graph(
     req: A2ARequest,
     graph: CompiledStateGraph,
 ) -> AsyncIterator[str]:
     """
-    Async generator that runs the billing LangGraph via astream_events
-    and yields SSE-formatted strings.
+    Runs the billing LangGraph via astream_events and yields SSE strings.
 
-    Event types emitted:
-      - tool_call : fired when the LLM decides to invoke a tool.
-                    Carries the tool name so the caller can show
-                    a status hint like "Looking up your balance…"
-      - token     : fired for every text chunk the LLM streams.
-                    Carries {"text": "<chunk>"}.
-      - done      : fired once after the graph finishes.
-                    Carries request_id, agent name, and status.
-      - error     : fired if an exception is raised mid-stream.
-                    Carries {"message": "<error text>"}.
+    Vertex AI does NOT emit on_chat_model_stream events — it returns the
+    full LLM response in a single on_chain_stream event once generation
+    is complete.
+
+    We filter on_chain_stream to ONLY the format_response node.
+    That node's chunk always has the shape:
+        {"final_response": "<the AI answer text>"}
+    Filtering by node name prevents tool result JSON from the "tools"
+    node leaking out as token events.
     """
     initial_state: BillingState = {
         "request_id":     req.request_id,
@@ -254,37 +250,34 @@ async def stream_billing_graph(
     try:
         async for event in graph.astream_events(initial_state, version="v2"):
             kind = event["event"]
+            name = event.get("name", "")
 
             # ── Tool invocation ──────────────────────────────────────────────
-            # Fired once per tool call, before the tool actually runs.
-            # We surface the tool name so the orchestrator / UI can display
-            # a "working…" indicator.
             if kind == "on_tool_start":
                 tool_name = event.get("name", "unknown_tool")
                 yield _sse("tool_call", {"tool": tool_name})
 
-            # ── Streaming LLM tokens ─────────────────────────────────────────
-            # on_chat_model_stream fires once per token chunk.
-            # We only forward chunks that contain actual text (not tool-call
-            # scaffolding, which has no .content or empty .content).
+            # ── Token-by-token streaming (OpenAI / future Vertex) ────────────
             elif kind == "on_chat_model_stream":
                 chunk = event["data"].get("chunk")
                 if chunk is None:
                     continue
+                text = _extract_text(chunk.content)
+                if text:
+                    yield _sse("token", {"text": text})
 
-                # AIMessageChunk.content can be a string or a list of dicts
-                # (the list form appears when the model is mid-tool-call).
-                # We only want plain text chunks.
-                content = chunk.content
-                if isinstance(content, str) and content:
-                    yield _sse("token", {"text": content})
-                elif isinstance(content, list):
-                    # Extract text from list-form content blocks
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "")
-                            if text:
-                                yield _sse("token", {"text": text})
+            # ── Full response in one shot (current Vertex AI behaviour) ──────
+            # Filter strictly to format_response node only.
+            # That node sets state["final_response"] — the chunk looks like:
+            #   {"final_response": "I see your last invoice..."}
+            # Ignoring all other nodes prevents tool result JSON leaking.
+            elif kind == "on_chain_stream" and name == "format_response":
+                chunk = event.get("data", {}).get("chunk")
+                if not isinstance(chunk, dict):
+                    continue
+                text = chunk.get("final_response", "")
+                if isinstance(text, str) and text:
+                    yield _sse("token", {"text": text})
 
         # ── Completion ───────────────────────────────────────────────────────
         yield _sse("done", {
@@ -294,8 +287,6 @@ async def stream_billing_graph(
         })
 
     except Exception as exc:
-        # Surface the error as an SSE event so the orchestrator can handle
-        # it gracefully rather than seeing a broken stream with no explanation.
         yield _sse("error", {"message": str(exc)})
 
 
@@ -309,48 +300,20 @@ billing_graph: CompiledStateGraph = build_billing_graph()
 
 @app.on_event("startup")
 def on_startup():
-    """Create DB tables on first run. Safe to call on every restart."""
     create_db_and_tables()
 
 
-# -----------------------------------------------------------------------------
-# NEW — streaming endpoint
-# The orchestrator calls this and reads the SSE stream token by token.
-# Response has no response_model because it is a raw stream, not a JSON body.
-# -----------------------------------------------------------------------------
 @app.post("/process/stream")
 async def process_stream(req: A2ARequest) -> StreamingResponse:
-    """
-    Streaming A2A endpoint.
-    Runs the billing ReAct graph and pushes SSE events as they happen:
-      - tool_call events when a DB lookup starts
-      - token     events for each LLM output chunk
-      - done      event when the graph finishes
-      - error     event on failure
-
-    The caller must read the response as a stream (not buffer it).
-    Content-Type is text/event-stream.
-    """
     return StreamingResponse(
         stream_billing_graph(req, billing_graph),
         media_type="text/event-stream",
-        # Disable buffering proxies / nginx would otherwise apply.
-        # X-Accel-Buffering: no tells nginx to pass chunks straight through.
         headers={"X-Accel-Buffering": "no"},
     )
 
 
-# -----------------------------------------------------------------------------
-# KEPT — original blocking endpoint
-# Still available so the orchestrator can fall back to non-streaming mode
-# during a migration, or for callers that don't support SSE.
-# -----------------------------------------------------------------------------
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
-    """
-    Original blocking A2A endpoint — unchanged.
-    Runs the full graph and returns a single A2AResponse JSON body.
-    """
     initial_state: BillingState = {
         "request_id":     req.request_id,
         "user_message":   req.user_message,
