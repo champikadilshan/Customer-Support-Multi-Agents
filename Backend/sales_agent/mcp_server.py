@@ -20,9 +20,7 @@ from neo4j.exceptions import ServiceUnavailable, AuthError
 from shared.config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, SALES_MCP_PORT
 
 
-# =============================================================================
 # NEO4J DRIVER — created once at module level, reused across all tool calls
-# =============================================================================
 
 try:
     driver = GraphDatabase.driver(
@@ -50,18 +48,14 @@ def run_query(cypher: str, params: dict = {}) -> list[dict]:
         return [dict(record) for record in result]
 
 
-# =============================================================================
 # MCP SERVER
 # Tools defined here — NOT in the agent.
 # The LLM discovers these automatically when the agent connects via SSE.
-# =============================================================================
 
 mcp = FastMCP("Sales MCP")
 
 
-# =============================================================================
 # TOOL 1 — Product catalogue
-# =============================================================================
 
 @mcp.tool()
 def get_product_catalog(category: str) -> list[dict]:
@@ -100,9 +94,7 @@ def get_product_catalog(category: str) -> list[dict]:
         return [{"error": str(e)}]
 
 
-# =============================================================================
 # TOOL 2 — Active promotions
-# =============================================================================
 
 @mcp.tool()
 def get_active_promotions(product_id: str = "") -> list[dict]:
@@ -146,9 +138,7 @@ def get_active_promotions(product_id: str = "") -> list[dict]:
         return [{"error": str(e)}]
 
 
-# =============================================================================
 # TOOL 3 — Product availability
-# =============================================================================
 
 @mcp.tool()
 def check_product_availability(product_id: str) -> dict:
@@ -186,14 +176,12 @@ def check_product_availability(product_id: str) -> dict:
         return {"error": str(e)}
 
 
-# =============================================================================
 # ASGI APP — expose the FastMCP SSE app for uvicorn
 #
 # Run with:
 #     uvicorn sales_agent.mcp_server:app --port $SALES_MCP_PORT
 # Or directly:
 #     python sales_agent/mcp_server.py
-# =============================================================================
 
 # FastMCP exposes its SSE ASGI app via .sse_app()
 # This is what uvicorn needs to find when you pass "mcp_server:app"

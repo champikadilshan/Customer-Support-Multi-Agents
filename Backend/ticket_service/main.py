@@ -12,9 +12,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from shared.config import TICKET_SERVICE_PORT
 
 
-# =============================================================================
 # DATABASE SETUP
-# =============================================================================
 
 DB_PATH      = Path(__file__).resolve().parent / "tickets.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
@@ -26,9 +24,7 @@ def get_session():
         yield session
 
 
-# =============================================================================
 # ENUMS
-# =============================================================================
 
 class TicketStatus(str, Enum):
     open        = "open"
@@ -37,9 +33,7 @@ class TicketStatus(str, Enum):
     closed      = "closed"
 
 
-# =============================================================================
 # DB MODEL
-# =============================================================================
 
 class Ticket(SQLModel, table=True):
     id:          Optional[int]      = Field(default=None, primary_key=True)
@@ -57,9 +51,7 @@ class Ticket(SQLModel, table=True):
     updated_at:  datetime           = Field(default_factory=datetime.utcnow)
 
 
-# =============================================================================
 # REQUEST / RESPONSE SCHEMAS
-# =============================================================================
 
 class TicketCreate(BaseModel):
     title:       str
@@ -94,9 +86,7 @@ class TicketResponse(BaseModel):
         from_attributes = True
 
 
-# =============================================================================
 # APP
-# =============================================================================
 
 app = FastAPI(
     title="Ticket Service",
@@ -111,9 +101,7 @@ def on_startup():
     SQLModel.metadata.create_all(engine)
 
 
-# =============================================================================
 # ROUTES
-# =============================================================================
 
 @app.post("/tickets", response_model=TicketResponse, status_code=201)
 def create_ticket(
@@ -201,9 +189,7 @@ def health():
     return {"status": "ok", "service": "ticket_service"}
 
 
-# =============================================================================
 # ENTRY POINT
-# =============================================================================
 
 if __name__ == "__main__":
     uvicorn.run(

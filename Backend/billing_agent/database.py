@@ -1,7 +1,6 @@
 from pathlib import Path
 from sqlmodel import SQLModel, Session, create_engine
 
-# ── DB file sits next to this module inside billing_agent/ ───────────────────
 DB_PATH      = Path(__file__).resolve().parent / "billing.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 

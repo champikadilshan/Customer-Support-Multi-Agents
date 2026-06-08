@@ -16,9 +16,7 @@ from neo4j import GraphDatabase
 from shared.config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
 
 
-# =============================================================================
 # DRIVER
-# =============================================================================
 
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
 
@@ -27,9 +25,7 @@ def run(session, cypher: str, params: dict = {}) -> None:
     session.run(cypher, params)
 
 
-# =============================================================================
 # SEED DATA
-# =============================================================================
 
 def seed_categories(session) -> None:
     categories = [
@@ -250,9 +246,7 @@ def seed_promotions(session) -> None:
     print(f"  Merged {len(promotions)} Promotion nodes with APPLIES_TO relationships")
 
 
-# =============================================================================
 # MAIN
-# =============================================================================
 
 def seed() -> None:
     print("Connecting to Neo4j...")

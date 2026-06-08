@@ -17,9 +17,7 @@ from shared.config import SALES_AGENT_PORT, AGENT_HOST, SALES_MCP_PORT
 from shared.llm import get_vertex_llm
 
 
-# =============================================================================
 # MCP CLIENT
-# =============================================================================
 
 mcp_client = MultiServerMCPClient({
     "sales": {
@@ -29,9 +27,7 @@ mcp_client = MultiServerMCPClient({
 })
 
 
-# =============================================================================
 # LANGGRAPH STATE
-# =============================================================================
 
 class SalesState(TypedDict):
     request_id:     str
@@ -40,16 +36,12 @@ class SalesState(TypedDict):
     final_response: str
 
 
-# =============================================================================
 # LLM
-# =============================================================================
 
 llm = get_vertex_llm(temperature=0)
 
 
-# =============================================================================
 # GRAPH
-# =============================================================================
 
 sales_graph: CompiledStateGraph = None
 mcp_tools:   list               = []
@@ -109,9 +101,7 @@ def build_sales_graph(tools: list) -> CompiledStateGraph:
     return graph.compile()
 
 
-# =============================================================================
 # SSE HELPERS
-# =============================================================================
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -129,9 +119,7 @@ def _extract_text(content) -> str:
     return ""
 
 
-# =============================================================================
 # STREAMING GENERATOR
-# =============================================================================
 
 async def stream_sales_graph(
     req: A2ARequest,
@@ -192,9 +180,7 @@ async def stream_sales_graph(
         yield _sse("error", {"message": str(exc)})
 
 
-# =============================================================================
 # FASTAPI LIFESPAN
-# =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -224,9 +210,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-# =============================================================================
 # FASTAPI
-# =============================================================================
 
 app = FastAPI(title="Sales Agent", version="1.0", lifespan=lifespan)
 

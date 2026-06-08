@@ -20,9 +20,7 @@ from sqlmodel import Session, select
 from ticket_service.main import engine, Ticket, TicketStatus, on_startup
 
 
-# =============================================================================
 # SAMPLE TICKETS
-# =============================================================================
 
 TICKETS = [
     # CUST-001 — 4 tickets covering different categories
@@ -97,9 +95,7 @@ TICKETS = [
 ]
 
 
-# =============================================================================
 # SEED FUNCTION
-# =============================================================================
 
 def seed() -> None:
     # Ensure tables exist before seeding
