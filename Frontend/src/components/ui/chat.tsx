@@ -83,7 +83,7 @@ export function Chat({
       ) : null}
 
       <form
-        className="mt-auto"
+        className="mt-52"
         onSubmit={(event) => {
           event.preventDefault()
           handleSubmit(event)
@@ -116,7 +116,7 @@ export function ChatMessages({
 
   return (
     <div
-      className="grid grid-cols-1 overflow-y-auto pb-4"
+      className="grid max-h-[320px] grid-cols-1 overflow-y-auto pb-4"
       ref={containerRef}
       onScroll={handleScroll}
       onTouchStart={handleTouchStart}
@@ -150,7 +150,7 @@ export const ChatContainer = forwardRef<
   return (
     <div
       ref={ref}
-      className={cn("grid max-h-full w-full grid-rows-[1fr_auto]", className)}
+      className={cn("flex w-full flex-col", className)}
       {...props}
     />
   )

@@ -116,6 +116,14 @@ def create_ticket(
     return ticket
 
 
+@app.get("/tickets", response_model=list[TicketResponse])
+def list_tickets(session: Session = Depends(get_session)):
+    """List all tickets, most recent first."""
+    return session.exec(
+        select(Ticket).order_by(Ticket.created_at.desc())
+    ).all()
+
+
 @app.get("/tickets/customer/{customer_id}", response_model=list[TicketResponse])
 def get_tickets_by_customer(
     customer_id: str,
