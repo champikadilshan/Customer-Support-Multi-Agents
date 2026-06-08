@@ -12,3 +12,9 @@ ENV/
 # Local SQLite database
 tickets.db
 billing.db
+
+# Frontend
+Frontend/node_modules/
+Frontend/.next/
+Frontend/.env
+Frontend/.env.local
