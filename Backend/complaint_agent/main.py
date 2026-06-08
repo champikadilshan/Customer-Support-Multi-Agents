@@ -22,12 +22,10 @@ from shared.llm import get_vertex_llm
 TICKET_SERVICE_URL = f"http://{AGENT_HOST}:{TICKET_SERVICE_PORT}"
 
 
-# =============================================================================
 # TOOLS  (bound to the LLM — read-only operations)
 # create_ticket is intentionally NOT in this list — the LLM never calls it
 # directly. It is invoked manually inside create_ticket_node after HITL
 # approval, so the human always gates the write operation.
-# =============================================================================
 
 @tool
 def get_complaint_history(customer_id: str) -> list[dict]:
@@ -148,9 +146,7 @@ def stage_ticket_creation(
     }
 
 
-# =============================================================================
 # LANGGRAPH STATE
-# =============================================================================
 
 class ComplaintState(TypedDict):
     request_id:          str
@@ -163,9 +159,7 @@ class ComplaintState(TypedDict):
     pending_ticket_data: Optional[dict]   # staged ticket payload
 
 
-# =============================================================================
 # LLM
-# =============================================================================
 
 # stage_ticket_creation IS in TOOLS so the LLM can call it to signal intent.
 # The actual POST to the ticket service happens only after HITL approval.
@@ -175,9 +169,7 @@ llm = get_vertex_llm(temperature=0)
 llm_with_tools = llm.bind_tools(TOOLS)
 
 
-# =============================================================================
 # NODES
-# =============================================================================
 
 def agent_node(state: ComplaintState) -> ComplaintState:
     system_prompt = (
@@ -318,9 +310,7 @@ def ticket_declined_node(state: ComplaintState) -> ComplaintState:
     }
 
 
-# =============================================================================
 # CONDITIONAL EDGES
-# =============================================================================
 
 def after_tools_condition(state: ComplaintState) -> Literal["hitl_checkpoint", "agent"]:
     """
@@ -343,9 +333,7 @@ def after_hitl_resume_condition(state: ComplaintState) -> Literal["create_ticket
     return "ticket_declined"
 
 
-# =============================================================================
 # BUILD GRAPH
-# =============================================================================
 
 def build_complaint_graph(checkpointer: InMemorySaver) -> CompiledStateGraph:
     """
@@ -432,9 +420,7 @@ def build_complaint_graph(checkpointer: InMemorySaver) -> CompiledStateGraph:
     )
 
 
-# =============================================================================
 # SSE HELPERS
-# =============================================================================
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -452,9 +438,7 @@ def _extract_text(content) -> str:
     return ""
 
 
-# =============================================================================
 # STREAMING GENERATOR — initial request
-# =============================================================================
 
 async def stream_complaint_graph(
     req: A2ARequest,
@@ -547,9 +531,7 @@ async def stream_complaint_graph(
         yield _sse("error", {"message": str(exc)})
 
 
-# =============================================================================
 # STREAMING GENERATOR — resume after HITL
-# =============================================================================
 
 async def stream_complaint_resume(
     request_id:    str,
@@ -613,9 +595,7 @@ async def stream_complaint_resume(
         yield _sse("error", {"message": str(exc)})
 
 
-# =============================================================================
 # FASTAPI
-# =============================================================================
 
 app = FastAPI(title="Complaint Agent", version="1.0")
 

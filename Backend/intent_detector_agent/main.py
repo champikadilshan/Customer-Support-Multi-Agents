@@ -16,9 +16,7 @@ from shared.llm import get_vertex_llm
 VALID_INTENTS = {"billing", "complaint", "sales"}
 
 
-# =============================================================================
 # LANGGRAPH STATE
-# =============================================================================
 
 class OrchestratorState(TypedDict):
     user_message:    str
@@ -29,16 +27,12 @@ class OrchestratorState(TypedDict):
     final_response:  str
 
 
-# =============================================================================
 # LLM
-# =============================================================================
 
 llm = get_vertex_llm(temperature=0)
 
 
-# =============================================================================
 # NODE 1 — Detect intent
-# =============================================================================
 
 def detect_intent_node(state: OrchestratorState) -> OrchestratorState:
     """
@@ -77,10 +71,8 @@ def detect_intent_node(state: OrchestratorState) -> OrchestratorState:
     }
 
 
-# =============================================================================
 # NODE 2 — Dispatch to specialist agent via A2A HTTP call
 # Used only by the original blocking /chat endpoint — unchanged.
-# =============================================================================
 
 async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
     """
@@ -139,9 +131,7 @@ async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
         }
 
 
-# =============================================================================
 # NODE 3 — Format final response back to the user
-# =============================================================================
 
 def format_response_node(state: OrchestratorState) -> OrchestratorState:
     """
@@ -159,9 +149,7 @@ def format_response_node(state: OrchestratorState) -> OrchestratorState:
     return {**state, "final_response": final}
 
 
-# =============================================================================
 # FALLBACK NODE — unknown intent
-# =============================================================================
 
 def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
     return {
@@ -173,9 +161,7 @@ def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
     }
 
 
-# =============================================================================
 # CONDITIONAL EDGE — route based on detected intent
-# =============================================================================
 
 def route_intent(state: OrchestratorState) -> Literal["dispatch", "unknown_intent"]:
     if state["detected_intent"] in VALID_INTENTS:
@@ -183,9 +169,7 @@ def route_intent(state: OrchestratorState) -> Literal["dispatch", "unknown_inten
     return "unknown_intent"
 
 
-# =============================================================================
 # BUILD GRAPH
-# =============================================================================
 
 def build_orchestrator_graph() -> CompiledStateGraph:
     """
@@ -231,9 +215,7 @@ def build_orchestrator_graph() -> CompiledStateGraph:
     return graph.compile()
 
 
-# =============================================================================
 # SSE HELPER
-# =============================================================================
 
 def _sse(event: str, data: dict) -> str:
     """
@@ -244,12 +226,10 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-# =============================================================================
 # STREAMING DISPATCH — used only by /chat/stream
 # Bypasses the LangGraph dispatch node entirely.
 # Calls detect_intent_node directly (blocking, ~1s), then opens an httpx
 # SSE stream to the specialist agent and forwards every line as-is.
-# =============================================================================
 
 async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
     """
@@ -378,9 +358,7 @@ async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
         })
 
 
-# =============================================================================
 # FASTAPI
-# =============================================================================
 
 app = FastAPI(title="Intent Detector — Orchestrator", version="1.0")
 orchestrator: CompiledStateGraph = build_orchestrator_graph()

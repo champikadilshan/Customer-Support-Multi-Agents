@@ -19,10 +19,7 @@ from billing_agent.models import AccountBalance, Invoice, PaymentMethod
 from sqlmodel import select
 
 
-# =============================================================================
 # TOOLS
-# =============================================================================
-
 @tool
 def get_account_balance(account_id: str) -> dict:
     """
@@ -111,10 +108,7 @@ def get_payment_methods(account_id: str) -> dict:
     }
 
 
-# =============================================================================
 # LANGGRAPH STATE
-# =============================================================================
-
 class BillingState(TypedDict):
     request_id:     str
     user_message:   str
@@ -122,9 +116,7 @@ class BillingState(TypedDict):
     final_response: str
 
 
-# =============================================================================
 # LLM
-# =============================================================================
 
 TOOLS = [get_account_balance, get_invoice_history, get_payment_methods]
 
@@ -132,9 +124,7 @@ llm = get_vertex_llm(temperature=0)
 llm_with_tools = llm.bind_tools(TOOLS)
 
 
-# =============================================================================
 # NODES
-# =============================================================================
 
 def agent_node(state: BillingState) -> BillingState:
     system_prompt = (
@@ -164,9 +154,7 @@ def format_response_node(state: BillingState) -> BillingState:
     return {**state, "final_response": final}
 
 
-# =============================================================================
 # BUILD GRAPH
-# =============================================================================
 
 def build_billing_graph() -> CompiledStateGraph:
     graph = StateGraph(BillingState)
@@ -192,9 +180,7 @@ def build_billing_graph() -> CompiledStateGraph:
     return graph.compile()
 
 
-# =============================================================================
 # SSE HELPER
-# =============================================================================
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -219,9 +205,7 @@ def _extract_text(content) -> str:
     return ""
 
 
-# =============================================================================
 # STREAMING GENERATOR
-# =============================================================================
 
 async def stream_billing_graph(
     req: A2ARequest,
@@ -290,9 +274,7 @@ async def stream_billing_graph(
         yield _sse("error", {"message": str(exc)})
 
 
-# =============================================================================
 # FASTAPI
-# =============================================================================
 
 app = FastAPI(title="Billing Agent", version="1.0")
 billing_graph: CompiledStateGraph = build_billing_graph()
