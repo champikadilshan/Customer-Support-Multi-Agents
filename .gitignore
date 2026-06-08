@@ -11,3 +11,4 @@ ENV/
 
 # Local SQLite database
 tickets.db
+billing.db
