@@ -68,3 +68,20 @@ uvicorn sales_agent.mcp_server:app --port $SALES_MCP_PORT
 - Intent detector: http://localhost:8001/docs
 
 Ports are configured in `.env`.
+
+
+```bash
+curl -X POST http://localhost:8001/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What is my current account balance and when is my next payment due?"}'
+```
+```bash
+curl -X POST http://localhost:8001/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Can you check the status of my complaint about a wrong charge on my invoice?"}'
+```
+```bash
+curl -X POST http://localhost:8001/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What internet plans do you have and are there any current promotions?"}'
+```
