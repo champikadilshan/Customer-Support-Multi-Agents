@@ -81,6 +81,10 @@ export function Chat({
         }),
         isHitlResponding:
           isGenerating && Boolean(message.hitlResponse && message.hitlRequest),
+        animation:
+          message.hitlRequest || (isLastAssistant && isGenerating)
+            ? ("none" as const)
+            : ("scale" as const),
         onHitlRespond:
           message.hitlRequest && !message.hitlResponse && respondToHitl
             ? (response: "yes" | "no") => respondToHitl(message.id, response)
@@ -144,6 +148,7 @@ export function ChatMessages({
 }>) {
   const {
     containerRef,
+    contentRef,
     scrollToBottom,
     handleScroll,
     shouldAutoScroll,
@@ -151,37 +156,38 @@ export function ChatMessages({
   } = useAutoScroll([messages, isGenerating, isHitlPending])
 
   useEffect(() => {
-    if (!isGenerating || !shouldAutoScroll) return
+    if (!shouldAutoScroll) return
+
+    scrollToBottom()
 
     const intervalId = window.setInterval(scrollToBottom, 48)
     return () => window.clearInterval(intervalId)
-  }, [isGenerating, shouldAutoScroll, scrollToBottom])
+  }, [messages, isGenerating, isHitlPending, shouldAutoScroll, scrollToBottom])
 
   return (
-    <div
-      className="scrollbar-hidden min-h-0 flex-1 overflow-y-auto pb-4"
-      ref={containerRef}
-      onScroll={handleScroll}
-      onTouchStart={handleTouchStart}
-    >
-      <div className="max-w-full [grid-column:1/1] [grid-row:1/1]">
-        {children}
+    <div className="relative min-h-0 flex-1">
+      <div
+        className="scrollbar-hidden h-full overflow-y-auto overflow-x-hidden pb-4"
+        ref={containerRef}
+        onScroll={handleScroll}
+        onTouchStart={handleTouchStart}
+      >
+        <div ref={contentRef} className="min-h-0">
+          {children}
+        </div>
       </div>
 
-      {!shouldAutoScroll && (
-        <div className="pointer-events-none flex flex-1 items-end justify-end [grid-column:1/1] [grid-row:1/1]">
-          <div className="sticky bottom-0 left-0 flex w-full justify-end">
-            <Button
-              onClick={scrollToBottom}
-              className="pointer-events-auto h-8 w-8 rounded-full ease-in-out animate-in fade-in-0 slide-in-from-bottom-1"
-              size="icon"
-              variant="ghost"
-            >
-              <ArrowDown className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-      )}
+      {!shouldAutoScroll ? (
+        <Button
+          onClick={scrollToBottom}
+          className="absolute bottom-2 right-0 z-10 h-8 w-8 rounded-full shadow-sm ease-in-out animate-in fade-in-0 slide-in-from-bottom-1"
+          size="icon"
+          variant="secondary"
+          aria-label="Scroll to latest message"
+        >
+          <ArrowDown className="h-4 w-4" />
+        </Button>
+      ) : null}
     </div>
   )
 }

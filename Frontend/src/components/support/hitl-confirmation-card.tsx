@@ -4,7 +4,6 @@ import { CheckCircle2, ShieldCheck, XCircle } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { type HitlRequest } from "@/lib/hitl"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 
 type HitlConfirmationCardProps = {
@@ -16,14 +15,6 @@ type HitlConfirmationCardProps = {
   className?: string
 }
 
-function priorityVariant(priority?: string) {
-  if (!priority) return "muted" as const
-  if (priority === "critical") return "critical" as const
-  if (priority === "high") return "high" as const
-  if (priority === "medium") return "medium" as const
-  return "low" as const
-}
-
 export function HitlConfirmationCard({
   request,
   response,
@@ -32,9 +23,11 @@ export function HitlConfirmationCard({
   onRespond,
   className,
 }: HitlConfirmationCardProps) {
-  const { ticket_preview: preview } = request
   const yesLabel = request.options[0] ?? "Yes, create ticket"
   const noLabel = request.options[1] ?? "No, cancel"
+  const prompt =
+    request.question.split("\n\n").at(-1) ??
+    "Shall I go ahead and create this support ticket for you?"
 
   if (response) {
     const approved = response === "yes"
@@ -64,7 +57,7 @@ export function HitlConfirmationCard({
   return (
     <div
       className={cn(
-        "w-full max-w-md rounded-lg border border-border/60 bg-muted/50 p-4 duration-300 animate-in fade-in-0 slide-in-from-left",
+        "w-full max-w-md rounded-lg border border-border/60 bg-muted/50 p-4 duration-300 animate-in fade-in-0",
         className
       )}
     >
@@ -75,29 +68,11 @@ export function HitlConfirmationCard({
         </p>
       </div>
 
-      {preview.title ? (
-        <h4 className="mt-3 text-sm font-semibold leading-snug">
-          {preview.title}
-        </h4>
-      ) : null}
-
-      <div className="mt-2 flex flex-wrap gap-2">
-        {preview.category ? (
-          <Badge variant="outline">{preview.category.replace(/_/g, " ")}</Badge>
-        ) : null}
-        {preview.priority ? (
-          <Badge variant={priorityVariant(preview.priority)}>
-            {preview.priority}
-          </Badge>
-        ) : null}
-      </div>
-
-      <p className="mt-3 text-sm font-light leading-relaxed text-muted-foreground">
-        {request.question.split("\n\n").at(-1) ??
-          "Shall I go ahead and create this support ticket for you?"}
+      <p className="mt-1.5 text-sm font-light leading-relaxed text-muted-foreground">
+        {prompt}
       </p>
 
-      <div className="mt-4 flex flex-wrap gap-2">
+      <div className="mt-2.5 flex flex-wrap gap-2">
         <Button
           type="button"
           size="sm"
