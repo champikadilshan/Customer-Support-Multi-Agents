@@ -1,79 +1,152 @@
+"""
+intent_detector/main.py
+-----------------------
+Orchestrator with persistent conversation sessions.
+
+Key changes vs original
+------------------------
+1. Every /chat and /chat/stream request accepts an optional session_id.
+   If omitted, a new session is created and the id is returned to the client.
+
+2. Sticky routing (Option B):
+   - If the session already has an active_agent, dispatch there directly —
+     the full conversation history is still passed so the LLM reasons correctly
+     even mid-conversation.
+   - If no active_agent yet, run detect_intent_node (which also receives the
+     history as context), then set the active_agent for subsequent turns.
+
+3. Topic-change detection:
+   - After every intent classification the orchestrator checks whether the new
+     intent differs from the sticky agent. If it does, it updates the
+     active_agent so the next turn routes to the right specialist.
+
+4. Session management endpoints:
+   POST /session/reset   — clear history + active_agent for a session
+   DELETE /session/{sid} — remove session entirely
+   GET  /session/{sid}   — inspect session (debug)
+
+5. A2ARequest now carries conversation_history (serialised messages).
+   A2AResponse now returns new_messages which are written back to the store.
+"""
+
 import uuid
 import json
 import httpx
-import sys, os
+import sys
+import os
 import uvicorn
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
-from typing import TypedDict, Literal, AsyncIterator
+from pydantic import BaseModel
+from typing import TypedDict, Literal, AsyncIterator, Optional
+
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import AGENT_URLS, INTENT_DETECTOR_PORT
 from shared.llm import get_vertex_llm
+from shared.session_store import session_store
+from shared.message_utils import messages_to_dicts, dicts_to_messages
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 VALID_INTENTS = {"billing", "complaint", "sales"}
 
-# LANGGRAPH STATE
-class OrchestratorState(TypedDict):
-    user_message:    str
-    detected_intent: str
-    target_agent:    AgentType
-    a2a_response:    str
-    request_id:      str
-    final_response:  str
+AGENT_TYPE_MAP: dict[str, AgentType] = {
+    "billing":   AgentType.BILLING,
+    "complaint": AgentType.COMPLAINT,
+    "sales":     AgentType.SALES,
+}
 
-# LLM
+# ── LangGraph state ───────────────────────────────────────────────────────────
+
+class OrchestratorState(TypedDict):
+    user_message:         str
+    conversation_history: list[dict]   # serialised prior messages for context
+    detected_intent:      str
+    target_agent:         AgentType
+    a2a_response:         str
+    request_id:           str
+    final_response:       str
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+
 llm = get_vertex_llm(temperature=0)
 
+# ── Request / response schemas ────────────────────────────────────────────────
 
-# NODE 1 — Detect intent
+class ChatRequest(BaseModel):
+    message:    str
+    session_id: Optional[str] = None   # client sends this on follow-up turns
+
+class SessionResetRequest(BaseModel):
+    session_id: str
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _history_text(history: list[dict]) -> str:
+    """
+    Render serialised history as a readable block for injection into prompts.
+    Keeps it concise: only human and AI turns (tool noise excluded).
+    """
+    lines = []
+    for msg in history:
+        t = msg.get("type", "")
+        c = msg.get("content", "")
+        if t == "human" and c:
+            lines.append(f"User: {c}")
+        elif t == "ai" and c:
+            lines.append(f"Agent: {c}")
+    return "\n".join(lines)
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+# ── Node 1 — detect / re-detect intent ───────────────────────────────────────
+
 def detect_intent_node(state: OrchestratorState) -> OrchestratorState:
     """
-    Uses LLM to classify the user message into one of:
-    billing, complaint, sales.
-    Generates a unique request_id for tracing across agents.
+    Uses the LLM to classify the current user message into billing /
+    complaint / sales, taking the conversation history into account so
+    mid-conversation topic changes are handled correctly.
     """
-    prompt = f"""
-    You are an intent classifier for a customer support system.
-    Classify the following user message into EXACTLY one of these categories:
-    - billing   (invoices, payments, charges, account balance)
-    - complaint (issues, problems, bad experience, refund requests)
-    - sales     (product info, pricing, promotions, purchasing)
+    history_block = _history_text(state["conversation_history"])
+    history_section = (
+        f"\n\nConversation so far:\n{history_block}" if history_block else ""
+    )
 
-    Reply with ONLY the single word label. Nothing else.
+    prompt = f"""You are an intent classifier for a customer support system.
+Classify the following user message into EXACTLY one of these categories:
+- billing   (invoices, payments, charges, account balance)
+- complaint (issues, problems, bad experience, refund requests, raise a ticket)
+- sales     (product info, pricing, promotions, purchasing){history_section}
 
-    User message: {state['user_message']}
-    """
+Current user message: {state['user_message']}
+
+Reply with ONLY the single word label. Nothing else."""
+
     intent = llm.invoke(prompt).content.strip().lower()
 
-    # Fallback to unknown if LLM returns unexpected value
     if intent not in VALID_INTENTS:
         intent = "unknown"
-
-    agent_map = {
-        "billing":   AgentType.BILLING,
-        "complaint": AgentType.COMPLAINT,
-        "sales":     AgentType.SALES,
-    }
 
     return {
         **state,
         "detected_intent": intent,
-        "target_agent":    agent_map.get(intent, AgentType.BILLING),
+        "target_agent":    AGENT_TYPE_MAP.get(intent, AgentType.BILLING),
         "request_id":      str(uuid.uuid4()),
     }
 
 
-# NODE 2 — Dispatch to specialist agent via A2A HTTP call
+# ── Node 2 — dispatch to specialist ──────────────────────────────────────────
+
 async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
     """
-    Builds an A2ARequest and POSTs it to the correct specialist agent.
-    Waits for A2AResponse and stores the result.
-    Handles downstream failures gracefully so the orchestrator never crashes.
+    Builds an A2ARequest (including full conversation history) and POSTs it
+    to the correct specialist agent.  Stores the plain-text result.
     """
     req = A2ARequest(
         request_id=state["request_id"],
@@ -81,12 +154,13 @@ async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
         target_agent=state["target_agent"],
         user_message=state["user_message"],
         context={"detected_intent": state["detected_intent"]},
+        conversation_history=state["conversation_history"],
     )
 
     try:
         async with httpx.AsyncClient() as client:
             url = AGENT_URLS[state["target_agent"]]
-            response = await client.post( url,json=req.model_dump(), timeout=30.0, )
+            response = await client.post(url, json=req.model_dump(), timeout=30.0)
             response.raise_for_status()
             a2a_resp = A2AResponse(**response.json())
             return {**state, "a2a_response": a2a_resp.result}
@@ -97,20 +171,18 @@ async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
             **state,
             "a2a_response": (
                 f"The {agent_name} agent is currently unavailable. "
-                f"Please try again later."
+                "Please try again later."
             ),
         }
-
     except httpx.TimeoutException:
         agent_name = state["target_agent"].value
         return {
             **state,
             "a2a_response": (
                 f"The {agent_name} agent took too long to respond. "
-                f"Please try again."
+                "Please try again."
             ),
         }
-
     except httpx.HTTPStatusError as e:
         agent_name = state["target_agent"].value
         return {
@@ -122,12 +194,9 @@ async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
         }
 
 
-# NODE 3 — Format final response back to the user
+# ── Node 3 — format final response ───────────────────────────────────────────
+
 def format_response_node(state: OrchestratorState) -> OrchestratorState:
-    """
-    Cleans and structures the final reply to the end user.
-    Adds a small prefix showing which agent handled the request.
-    """
     agent_label = {
         AgentType.BILLING:   "Billing Support",
         AgentType.COMPLAINT: "Complaint Support",
@@ -135,11 +204,11 @@ def format_response_node(state: OrchestratorState) -> OrchestratorState:
     }.get(state["target_agent"], "Support")
 
     final = f"[{agent_label}]\n\n{state['a2a_response']}"
-
     return {**state, "final_response": final}
 
 
-# FALLBACK NODE — unknown intent
+# ── Fallback node ─────────────────────────────────────────────────────────────
+
 def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
     return {
         **state,
@@ -150,33 +219,15 @@ def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
     }
 
 
-# CONDITIONAL EDGE — route based on detected intent
+# ── Conditional edge ──────────────────────────────────────────────────────────
+
 def route_intent(state: OrchestratorState) -> Literal["dispatch", "unknown_intent"]:
-    if state["detected_intent"] in VALID_INTENTS:
-        return "dispatch"
-    return "unknown_intent"
+    return "dispatch" if state["detected_intent"] in VALID_INTENTS else "unknown_intent"
 
 
-# BUILD GRAPH
+# ── Build graph ───────────────────────────────────────────────────────────────
+
 def build_orchestrator_graph() -> CompiledStateGraph:
-    """
-    Graph shape:
-
-                        START
-                          |
-                   detect_intent_node
-                          |
-              conditional edge (route_intent)
-                 +--------+--------+
-                 |                 |
-            "dispatch"      "unknown_intent"
-                 |                 |
-       dispatch_to_agent       unknown_intent_node
-                 |                 |
-        format_response_node      END
-                 |
-                END
-    """
     graph = StateGraph(OrchestratorState)
 
     graph.add_node("detect_intent",   detect_intent_node)
@@ -202,172 +253,324 @@ def build_orchestrator_graph() -> CompiledStateGraph:
     return graph.compile()
 
 
-# SSE HELPER
-def _sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+# ── Core session-aware chat logic ─────────────────────────────────────────────
 
-
-async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
+async def _run_chat(
+    user_message: str,
+    session_id:   Optional[str],
+) -> tuple[dict, str]:
     """
-    Full streaming pipeline:
+    Shared logic for /chat (blocking) and the intent step of /chat/stream.
 
-      1. Run detect_intent_node directly (blocking LLM call, fast).
-         Yield an `intent` SSE event immediately so the client knows
-         which agent is handling the request before any tokens arrive.
+    Returns (result_dict, session_id).
 
-      2. Build an A2ARequest and open an httpx SSE stream to the
-         specialist agent's /process/stream endpoint.
-
-      3. Forward every line from the specialist stream straight to
-         the client — no buffering, no transformation.
-         The specialist already emits well-formed SSE lines
-         (event: …, data: …, blank line) so we pass them through raw.
-
-      4. Handle all error cases as SSE error events so the client
-         always sees a clean stream regardless of what goes wrong.
-
-    Why bypass the graph for streaming dispatch?
-      LangGraph's ainvoke is request/response — it collects the full
-      result before returning. There is no way to forward a live SSE
-      stream from a downstream agent through a LangGraph node.
-      The graph is still used for the blocking /chat endpoint unchanged.
+    result_dict keys:
+        intent, agent, request_id, response, new_messages
     """
+    sess = session_store.get_or_create(session_id)
+    sid  = sess.session_id
 
+    history     = session_store.get_messages(sid)
+    active_agent = session_store.get_active_agent(sid)
+
+    # ── Determine intent / target agent ───────────────────────────────────────
+    # Always run intent detection (with history for context), but if a sticky
+    # agent is already set we only update it when the intent genuinely changes.
     initial_state: OrchestratorState = {
-        "user_message":    user_message,
-        "detected_intent": "",
-        "target_agent":    AgentType.BILLING,   # placeholder, overwritten below
-        "a2a_response":    "",
-        "request_id":      "",
-        "final_response":  "",
+        "user_message":         user_message,
+        "conversation_history": history,
+        "detected_intent":      "",
+        "target_agent":         active_agent or AgentType.BILLING,
+        "a2a_response":         "",
+        "request_id":           "",
+        "final_response":       "",
     }
 
-    state = detect_intent_node(initial_state)
+    intent_state = detect_intent_node(initial_state)
+    intent       = intent_state["detected_intent"]
+    request_id   = intent_state["request_id"]
 
-    intent     = state["detected_intent"]
-    target     = state["target_agent"]
-    request_id = state["request_id"]
+    if intent in VALID_INTENTS:
+        new_agent = AGENT_TYPE_MAP[intent]
+        # Update sticky agent whenever intent changes (topic switch)
+        if new_agent != active_agent:
+            session_store.set_active_agent(sid, new_agent)
+            active_agent = new_agent
+    else:
+        # Unknown intent — keep sticky agent if we have one, else fail gracefully
+        if not active_agent:
+            return {
+                "intent":       intent,
+                "agent":        None,
+                "request_id":   request_id,
+                "response":     (
+                    "I'm sorry, I couldn't understand your request. "
+                    "Please ask about billing, a complaint, or our products."
+                ),
+                "new_messages": [],
+            }, sid
 
-    yield _sse("intent", {
+    # ── Append user message to session ────────────────────────────────────────
+    session_store.append_messages(sid, [{"type": "human", "content": user_message}])
+    # Refresh history to include the message we just appended
+    history = session_store.get_messages(sid)
+
+    return {
+        "intent":       intent,
+        "agent":        active_agent,
+        "request_id":   request_id,
+        "history":      history,          # full history including new user msg
+    }, sid
+
+
+# ── Streaming pipeline ────────────────────────────────────────────────────────
+
+async def stream_from_orchestrator(
+    user_message: str,
+    session_id:   Optional[str],
+) -> AsyncIterator[str]:
+    """
+    Full streaming pipeline with session support.
+
+    1. Resolve session, run intent detection (with history), set sticky agent.
+    2. Emit an `intent` SSE event.
+    3. Open an httpx SSE stream to the specialist's /process/stream endpoint,
+       passing the full conversation history in the A2ARequest body.
+    4. Forward every line from the specialist stream to the client.
+    5. On `done`, collect the final AI text from the stream and write it back
+       to the session as an AI message.
+    """
+    info, sid = await _run_chat(user_message, session_id)
+
+    # Unknown intent early-exit
+    if "response" in info:
+        yield _sse("session", {"session_id": sid})
+        yield _sse("error",   {"message": info["response"]})
+        return
+
+    intent       = info["intent"]
+    active_agent: AgentType = info["agent"]
+    request_id   = info["request_id"]
+    history      = info["history"]
+
+    yield _sse("session", {"session_id": sid})
+    yield _sse("intent",  {
         "intent":     intent,
-        "agent":      target.value,
+        "agent":      active_agent.value,
         "request_id": request_id,
     })
-
-    if intent not in VALID_INTENTS:
-        yield _sse("error", {
-            "message": (
-                "I'm sorry, I couldn't understand your request. "
-                "Please ask about billing, a complaint, or our products."
-            )
-        })
-        return
 
     req = A2ARequest(
         request_id=request_id,
         source_agent=AgentType.INTENT_DETECTOR,
-        target_agent=target,
+        target_agent=active_agent,
         user_message=user_message,
         context={"detected_intent": intent},
+        conversation_history=history,
     )
 
-    base_url    = AGENT_URLS[target]
-    stream_url  = base_url.replace("/process", "/process/stream")
+    base_url   = AGENT_URLS[active_agent]
+    stream_url = base_url.replace("/process", "/process/stream")
+
+    # Collect tokens so we can write the AI response back to the session
+    collected_tokens: list[str] = []
 
     try:
         async with httpx.AsyncClient() as client:
-            async with client.stream( "POST", stream_url, json=req.model_dump(),timeout=60.0,       ) as response:
+            async with client.stream(
+                "POST", stream_url,
+                json=req.model_dump(),
+                timeout=60.0,
+            ) as response:
                 response.raise_for_status()
 
-                async for line in response.aiter_lines():
-                    if line:
-                        yield line + "\n"
+                async for raw_line in response.aiter_lines():
+                    if raw_line.startswith("data:"):
+                        try:
+                            payload = json.loads(raw_line[5:].strip())
+                            if payload.get("text"):
+                                collected_tokens.append(payload["text"])
+                        except json.JSONDecodeError:
+                            pass
+
+                    if raw_line:
+                        yield raw_line + "\n"
                     else:
                         yield "\n"
+
+        # Write the AI reply back to the session store
+        ai_text = "".join(collected_tokens)
+        if ai_text:
+            session_store.append_messages(sid, [{"type": "ai", "content": ai_text}])
 
     except httpx.ConnectError:
         yield _sse("error", {
             "message": (
-                f"The {target.value} agent is currently unavailable. "
-                f"Please try again later."
+                f"The {active_agent.value} agent is currently unavailable. "
+                "Please try again later."
             )
         })
-
     except httpx.TimeoutException:
         yield _sse("error", {
             "message": (
-                f"The {target.value} agent took too long to respond. "
-                f"Please try again."
+                f"The {active_agent.value} agent took too long to respond. "
+                "Please try again."
             )
         })
-
     except httpx.HTTPStatusError as e:
         yield _sse("error", {
             "message": (
-                f"The {target.value} agent returned an error "
+                f"The {active_agent.value} agent returned an error "
                 f"(status {e.response.status_code}). Please try again."
             )
         })
 
 
-# FASTAPI
-app = FastAPI(title="Intent Detector — Orchestrator", version="1.0")
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Intent Detector — Orchestrator", version="2.0")
 orchestrator: CompiledStateGraph = build_orchestrator_graph()
 
 
-@app.post("/chat/stream")
-async def chat_stream(payload: dict) -> StreamingResponse:
-    """
-    Streaming entry point for all user messages.
-    Expects: { "message": "..." }
+# ── Chat endpoints ────────────────────────────────────────────────────────────
 
-    Emits a continuous SSE stream:
-      event: intent     — which agent was selected (from orchestrator)
-      event: tool_call  — a tool is being called   (forwarded from specialist)
-      event: token      — one LLM output chunk     (forwarded from specialist)
-      event: done       — specialist finished      (forwarded from specialist)
-      event: error      — something went wrong     (orchestrator or specialist)
+@app.post("/chat/stream")
+async def chat_stream(payload: ChatRequest) -> StreamingResponse:
+    """
+    Streaming entry point.  Accepts { "message": "...", "session_id": "..." }.
+    First SSE event is always:
+        event: session
+        data: {"session_id": "<uuid>"}
+    followed by the normal intent / tool_call / token / done / error events.
     """
     return StreamingResponse(
-        stream_from_orchestrator(payload["message"]),
+        stream_from_orchestrator(payload.message, payload.session_id),
         media_type="text/event-stream",
         headers={"X-Accel-Buffering": "no"},
     )
 
 
 @app.post("/chat")
-async def chat(payload: dict) -> dict:
+async def chat(payload: ChatRequest) -> dict:
     """
-    Entry point for all user messages.
-    Expects: { "message": "..." }
-    Returns: { "intent": "...", "agent": "...", "request_id": "...", "response": "..." }
-    """
-    initial_state: OrchestratorState = {
-        "user_message":    payload["message"],
-        "detected_intent": "",
-        "target_agent":    AgentType.BILLING,
-        "a2a_response":    "",
-        "request_id":      "",
-        "final_response":  "",
+    Blocking entry point.
+    Accepts { "message": "...", "session_id": "..." }.
+    Returns {
+        "session_id": "...",
+        "intent": "...",
+        "agent": "...",
+        "request_id": "...",
+        "response": "..."
     }
+    """
+    info, sid = await _run_chat(payload.message, payload.session_id)
 
-    result = await orchestrator.ainvoke(initial_state)
+    # Early exit for unknown intent
+    if "response" in info:
+        return {
+            "session_id": sid,
+            "intent":     info["intent"],
+            "agent":      None,
+            "request_id": info["request_id"],
+            "response":   info["response"],
+        }
+
+    active_agent: AgentType = info["agent"]
+    request_id               = info["request_id"]
+    history                  = info["history"]
+
+    req = A2ARequest(
+        request_id=request_id,
+        source_agent=AgentType.INTENT_DETECTOR,
+        target_agent=active_agent,
+        user_message=payload.message,
+        context={"detected_intent": info["intent"]},
+        conversation_history=history,
+    )
+
+    try:
+        async with httpx.AsyncClient() as client:
+            url = AGENT_URLS[active_agent]
+            response = await client.post(url, json=req.model_dump(), timeout=30.0)
+            response.raise_for_status()
+            a2a_resp = A2AResponse(**response.json())
+    except Exception as e:
+        return {
+            "session_id": sid,
+            "intent":     info["intent"],
+            "agent":      active_agent.value,
+            "request_id": request_id,
+            "response":   f"Error contacting agent: {e}",
+        }
+
+    # Write agent reply back to session
+    if a2a_resp.new_messages:
+        session_store.append_messages(sid, a2a_resp.new_messages)
+    elif a2a_resp.result:
+        session_store.append_messages(sid, [{"type": "ai", "content": a2a_resp.result}])
+
+    agent_label = {
+        AgentType.BILLING:   "Billing Support",
+        AgentType.COMPLAINT: "Complaint Support",
+        AgentType.SALES:     "Sales Support",
+    }.get(active_agent, "Support")
 
     return {
-        "intent":     result["detected_intent"],
-        "agent":      result["target_agent"],
-        "request_id": result["request_id"],
-        "response":   result["final_response"],
+        "session_id": sid,
+        "intent":     info["intent"],
+        "agent":      active_agent.value,
+        "request_id": request_id,
+        "response":   f"[{agent_label}]\n\n{a2a_resp.result}",
     }
 
+
+# ── Session management endpoints ──────────────────────────────────────────────
+
+@app.post("/session/reset")
+def session_reset(body: SessionResetRequest) -> dict:
+    """
+    Reset a session's conversation history and sticky agent.
+    Metadata (resolved account_id etc.) is preserved.
+    Returns 404 if the session_id is unknown.
+    """
+    ok = session_store.reset(body.session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Session '{body.session_id}' not found.")
+    return {"status": "reset", "session_id": body.session_id}
+
+
+@app.delete("/session/{session_id}")
+def session_delete(session_id: str) -> dict:
+    """Delete a session entirely."""
+    ok = session_store.delete(session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    return {"status": "deleted", "session_id": session_id}
+
+
+@app.get("/session/{session_id}")
+def session_info(session_id: str) -> dict:
+    """Inspect a session — useful for debugging."""
+    info = session_store.session_info(session_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    return info
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "agent": "intent_detector"}
+    return {
+        "status":        "ok",
+        "agent":         "intent_detector",
+        "active_sessions": len(session_store.all_session_ids()),
+    }
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-
     uvicorn.run(
         "intent_detector.main:app",
         host="0.0.0.0",
