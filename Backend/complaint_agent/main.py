@@ -65,13 +65,15 @@ class ResumeRequest(BaseModel):
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
-@tool
+@tool(
+    "get_complaint_history",
+    description=(
+        "Retrieve the past complaint tickets submitted by a customer. "
+        "Use this when the user references a previous complaint, asks about "
+        "the status of an existing issue, or wants to see their complaint history."
+    ),
+)
 def get_complaint_history(customer_id: str) -> list[dict]:
-    """
-    Retrieve the past complaint tickets submitted by a customer.
-    Use this when the user references a previous complaint, asks about
-    the status of an existing issue, or wants to see their complaint history.
-    """
     try:
         response = httpx.get(
             f"{TICKET_SERVICE_URL}/tickets/customer/{customer_id}",
@@ -88,12 +90,15 @@ def get_complaint_history(customer_id: str) -> list[dict]:
         return [{"error": "Ticket service request timed out. Please try again."}]
 
 
-@tool
+@tool(
+    "get_ticket_status",
+    description=(
+        "Retrieve the current status and full details of a specific complaint ticket. "
+        "Use this when the user provides a ticket ID and wants an update, "
+        "or when following up on a specific issue."
+    ),
+)
 def get_ticket_status(ticket_id: int) -> dict:
-    """
-    Retrieve the current status and full details of a specific complaint ticket.
-    Use this when the user provides a ticket ID and wants an update.
-    """
     try:
         response = httpx.get(
             f"{TICKET_SERVICE_URL}/tickets/{ticket_id}",
@@ -111,16 +116,15 @@ def get_ticket_status(ticket_id: int) -> dict:
         return {"error": "Ticket service request timed out. Please try again."}
 
 
-@tool
+@tool(
+    "categorize_complaint",
+    description=(
+        "Analyse a complaint description and return the category and recommended priority. "
+        "Use this at the start of handling any new complaint to classify the issue before staging a ticket. "
+        "Categories: billing_dispute, service_outage, product_defect, refund_request, rude_staff, delivery_issue, other."
+    ),
+)
 def categorize_complaint(description: str) -> dict:
-    """
-    Analyse the complaint description and return the category and
-    recommended priority level.
-    Use this at the start of handling a new complaint to understand
-    what type of issue the customer is facing.
-    Categories: billing_dispute, service_outage, product_defect,
-                refund_request, rude_staff, delivery_issue, other.
-    """
     desc = description.lower()
 
     if any(w in desc for w in ["charge", "invoice", "overcharged", "billed"]):
@@ -153,7 +157,14 @@ def categorize_complaint(description: str) -> dict:
     }
 
 
-@tool
+@tool(
+    "stage_ticket_creation",
+    description=(
+        "Stage a support ticket for creation pending customer confirmation — does NOT submit it yet. "
+        "Use this only after categorize_complaint has been called and you have a full complaint description and customer ID. "
+        "The ticket is created only after the customer confirms."
+    ),
+)
 def stage_ticket_creation(
     title:       str,
     description: str,
@@ -161,13 +172,6 @@ def stage_ticket_creation(
     category:    str,
     priority:    str,
 ) -> dict:
-    """
-    Stage a new support ticket for creation — does NOT create it yet.
-    Use this when you have fully understood the customer's complaint and
-    want to raise a ticket on their behalf.
-    The ticket will only be created after the customer confirms.
-    Always call categorize_complaint first so category and priority are accurate.
-    """
     return {
         "staged":      True,
         "title":       title,

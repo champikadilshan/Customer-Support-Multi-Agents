@@ -64,7 +64,7 @@ class BillingState(TypedDict):
         "how much they owe, or when their next payment is due."
     ),
 )
-def get_account_balance(account_id: str) -> dict:
+def get_account_balance(account_id: str) -> dict:  # noqa: D401
     with get_session() as session:
         row = session.exec(
             select(AccountBalance).where(AccountBalance.account_id == account_id)
@@ -82,13 +82,15 @@ def get_account_balance(account_id: str) -> dict:
     }
 
 
-@tool
+@tool(
+    "get_invoice_history",
+    description=(
+        "Retrieve the last 5 invoices for a given account ID. "
+        "Use this when the user asks about past invoices, billing history, "
+        "or wants to see previous charges."
+    ),
+)
 def get_invoice_history(account_id: str) -> list[dict]:
-    """
-    Retrieve the last 5 invoices for a given account ID.
-    Use this when the user asks about past invoices, billing history,
-    or wants to see previous charges.
-    """
     with get_session() as session:
         rows = session.exec(
             select(Invoice)
@@ -111,13 +113,15 @@ def get_invoice_history(account_id: str) -> list[dict]:
     ]
 
 
-@tool
+@tool(
+    "get_payment_methods",
+    description=(
+        "Retrieve the saved payment methods on file for a given account ID. "
+        "Use this when the user asks about their saved cards, bank accounts, "
+        "or wants to know how they can pay."
+    ),
+)
 def get_payment_methods(account_id: str) -> dict:
-    """
-    Retrieve the saved payment methods on file for a given account ID.
-    Use this when the user asks about their saved cards, bank accounts,
-    or wants to know how they can pay.
-    """
     with get_session() as session:
         rows = session.exec(
             select(PaymentMethod).where(PaymentMethod.account_id == account_id)

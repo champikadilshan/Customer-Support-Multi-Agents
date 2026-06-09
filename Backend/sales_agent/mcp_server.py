@@ -50,15 +50,14 @@ mcp = FastMCP("Sales MCP")
 
 
 # TOOL 1 — Product catalogue
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Retrieve products available in a given category with descriptions and prices. "
+        "Use this when the user asks what products are available, wants to compare options, or is looking for something specific. "
+        "Categories: internet, mobile, tv, bundle. Pass 'all' to get every product across all categories."
+    )
+)
 def get_product_catalog(category: str) -> list[dict]:
-    """
-    Retrieve products available in a given category with descriptions and prices.
-    Use this when the user asks about what products are available,
-    wants to compare options, or is looking for something specific.
-    Categories: internet, mobile, tv, bundle.
-    Pass 'all' to get every product across all categories.
-    """
     try:
         if category == "all":
             cypher = """
@@ -89,15 +88,14 @@ def get_product_catalog(category: str) -> list[dict]:
 
 
 # TOOL 2 — Active promotions
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Retrieve all currently active promotions, discounts, and special offers. "
+        "Use this when the user asks about deals, discounts, promotions, or ways to save money. "
+        "Optionally pass a product_id to filter promotions for a specific product; leave empty to get all promotions."
+    )
+)
 def get_active_promotions(product_id: str = "") -> list[dict]:
-    """
-    Retrieve all currently active promotions, discounts, and special offers.
-    Use this when the user asks about deals, discounts, promotions,
-    or ways to save money.
-    Optionally pass a product_id to filter promotions for a specific product.
-    Leave product_id empty to get all promotions.
-    """
     try:
         if product_id:
             cypher = """
@@ -133,14 +131,13 @@ def get_active_promotions(product_id: str = "") -> list[dict]:
 
 
 # TOOL 3 — Product availability
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Check whether a specific product is currently available and how quickly it can be activated. "
+        "Use this when the user is ready to purchase or wants to know if a product is in stock or can be set up."
+    )
+)
 def check_product_availability(product_id: str) -> dict:
-    """
-    Check whether a specific product is currently available and
-    how quickly it can be activated.
-    Use this when the user is ready to purchase or wants to know
-    if a product is in stock or can be set up.
-    """
     try:
         cypher = """
             MATCH (p:Product {id: $product_id})
