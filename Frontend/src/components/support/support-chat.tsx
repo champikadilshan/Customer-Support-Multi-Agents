@@ -23,9 +23,9 @@ export function SupportChat() {
 
   return (
     <>
-      <div className={cn("flex w-full flex-col")}>
+      <div className={cn("flex h-[448px] w-full flex-col")}>
         <Chat
-          className="grow"
+          className="h-full min-h-0"
           messages={messages}
           input={input}
           handleInputChange={handleInputChange}

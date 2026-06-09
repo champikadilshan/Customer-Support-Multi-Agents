@@ -22,7 +22,7 @@ export default function Home() {
                 Customer support that feels human, powered by AI.
               </PageHeaderHeading>
               <PageHeaderDescription>
-                Ask about billing, explore products, or raise a complaint our
+                Ask about billing, explore products, or raise a complaint — our
                 multi-agent system routes you to the right specialist instantly.
               </PageHeaderDescription>
               <PageActions>
