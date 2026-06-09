@@ -7,9 +7,9 @@ import { cn } from "@/lib/utils"
 import "./globals.css"
 
 export const metadata: Metadata = {
-  title: "shadcn-chatbot-kit",
+  title: "virtusa-multi-agent",
   description:
-    "Beautifully designed chatbot components based on shadcn/ui. Fully customizable and owned by you.",
+    "Customer support powered by AI billing, sales, and complaint agents in one place.",
 }
 
 export default function RootLayout({
