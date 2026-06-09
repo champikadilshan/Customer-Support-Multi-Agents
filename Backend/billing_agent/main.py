@@ -1,4 +1,9 @@
 import json
+import operator
+import sys, os
+import uvicorn
+from accelerate.commands.config.default import description
+
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from langgraph.graph import StateGraph, END
@@ -7,10 +12,6 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, BaseMessage
 from typing import TypedDict, Annotated, AsyncIterator
-import operator
-
-import sys, os
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import BILLING_AGENT_PORT
 from shared.llm import get_vertex_llm
@@ -18,9 +19,18 @@ from billing_agent.database import create_db_and_tables, get_session
 from billing_agent.models import AccountBalance, Invoice, PaymentMethod
 from sqlmodel import select
 
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+# LANGGRAPH STATE
+class BillingState(TypedDict):
+    request_id:     str
+    user_message:   str
+    messages:       Annotated[list[BaseMessage], operator.add]
+    final_response: str
+
 
 # TOOLS
-@tool
+@tool('get_account_balance', description=('Fetch the current account balance, payment due date, and payment status for a given account ID. Use this when the user asks about their balance, how much they owe, or when their next payment is due.'))
 def get_account_balance(account_id: str) -> dict:
     """
     Fetch the current account balance, payment due date, and payment status
@@ -28,10 +38,7 @@ def get_account_balance(account_id: str) -> dict:
     Use this when the user asks about their balance, how much they owe,
     or when their next payment is due.
     """
-    with get_session() as session:
-        row = session.exec(
-            select(AccountBalance).where(AccountBalance.account_id == account_id)
-        ).first()
+    with get_session() as session: row = session.exec( select(AccountBalance).where(AccountBalance.account_id == account_id) ).first()
 
     if not row:
         return {"error": f"No account found for account_id '{account_id}'"}
@@ -53,12 +60,7 @@ def get_invoice_history(account_id: str) -> list[dict]:
     or wants to see previous charges.
     """
     with get_session() as session:
-        rows = session.exec(
-            select(Invoice)
-            .where(Invoice.account_id == account_id)
-            .order_by(Invoice.date.desc())
-            .limit(5)
-        ).all()
+        rows = session.exec(select(Invoice).where(Invoice.account_id == account_id).order_by(Invoice.date.desc()) .limit(5) ).all()
 
     if not rows:
         return [{"error": f"No invoices found for account_id '{account_id}'"}]
@@ -82,24 +84,25 @@ def get_payment_methods(account_id: str) -> dict:
     or wants to know how they can pay.
     """
     with get_session() as session:
-        rows = session.exec(
-            select(PaymentMethod).where(PaymentMethod.account_id == account_id)
-        ).all()
+        rows = session.exec( select(PaymentMethod).where(PaymentMethod.account_id == account_id)).all()
 
     if not rows:
         return {"error": f"No payment methods found for account_id '{account_id}'"}
 
     methods = []
+
     for row in rows:
         entry = {
             "type":    row.type,
             "last4":   row.last4,
             "default": row.is_default,
         }
+
         if row.expiry:
             entry["expiry"] = row.expiry
         if row.bank:
             entry["bank"] = row.bank
+
         methods.append(entry)
 
     return {
@@ -108,16 +111,7 @@ def get_payment_methods(account_id: str) -> dict:
     }
 
 
-# LANGGRAPH STATE
-class BillingState(TypedDict):
-    request_id:     str
-    user_message:   str
-    messages:       Annotated[list[BaseMessage], operator.add]
-    final_response: str
-
-
 # LLM
-
 TOOLS = [get_account_balance, get_invoice_history, get_payment_methods]
 
 llm = get_vertex_llm(temperature=0)
@@ -125,7 +119,6 @@ llm_with_tools = llm.bind_tools(TOOLS)
 
 
 # NODES
-
 def agent_node(state: BillingState) -> BillingState:
     system_prompt = (
         "You are a helpful billing support agent. "
@@ -140,6 +133,7 @@ def agent_node(state: BillingState) -> BillingState:
     ]
 
     response = llm_with_tools.invoke(messages_with_system)
+
     return {"messages": [response]}
 
 
@@ -155,7 +149,6 @@ def format_response_node(state: BillingState) -> BillingState:
 
 
 # BUILD GRAPH
-
 def build_billing_graph() -> CompiledStateGraph:
     graph = StateGraph(BillingState)
 
@@ -181,7 +174,6 @@ def build_billing_graph() -> CompiledStateGraph:
 
 
 # SSE HELPER
-
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
@@ -206,11 +198,7 @@ def _extract_text(content) -> str:
 
 
 # STREAMING GENERATOR
-
-async def stream_billing_graph(
-    req: A2ARequest,
-    graph: CompiledStateGraph,
-) -> AsyncIterator[str]:
+async def stream_billing_graph(req: A2ARequest,graph: CompiledStateGraph,) -> AsyncIterator[str]:
     """
     Runs the billing LangGraph via astream_events and yields SSE strings.
 
@@ -236,34 +224,28 @@ async def stream_billing_graph(
             kind = event["event"]
             name = event.get("name", "")
 
-            # ── Tool invocation ──────────────────────────────────────────────
             if kind == "on_tool_start":
                 tool_name = event.get("name", "unknown_tool")
                 yield _sse("tool_call", {"tool": tool_name})
 
-            # ── Token-by-token streaming (OpenAI / future Vertex) ────────────
             elif kind == "on_chat_model_stream":
                 chunk = event["data"].get("chunk")
                 if chunk is None:
                     continue
+
                 text = _extract_text(chunk.content)
                 if text:
                     yield _sse("token", {"text": text})
 
-            # ── Full response in one shot (current Vertex AI behaviour) ──────
-            # Filter strictly to format_response node only.
-            # That node sets state["final_response"] — the chunk looks like:
-            #   {"final_response": "I see your last invoice..."}
-            # Ignoring all other nodes prevents tool result JSON leaking.
             elif kind == "on_chain_stream" and name == "format_response":
                 chunk = event.get("data", {}).get("chunk")
                 if not isinstance(chunk, dict):
                     continue
+
                 text = chunk.get("final_response", "")
                 if isinstance(text, str) and text:
                     yield _sse("token", {"text": text})
 
-        # ── Completion ───────────────────────────────────────────────────────
         yield _sse("done", {
             "request_id": req.request_id,
             "agent":      AgentType.BILLING.value,
@@ -275,7 +257,6 @@ async def stream_billing_graph(
 
 
 # FASTAPI
-
 app = FastAPI(title="Billing Agent", version="1.0")
 billing_graph: CompiledStateGraph = build_billing_graph()
 
@@ -320,7 +301,6 @@ def health():
 
 
 if __name__ == "__main__":
-    import uvicorn
 
     uvicorn.run(
         "billing_agent.main:app",

@@ -1,24 +1,65 @@
+from datetime import datetime
+from enum import Enum
 from typing import Optional
+
+from pydantic import BaseModel
 from sqlmodel import Field, SQLModel
 
 
-class ComplaintTicket(SQLModel, table=True):
-    id:          Optional[int] = Field(default=None, primary_key=True)
-    ticket_id:   str           = Field(index=True)           # e.g. "TKT-101"
-    customer_id: str           = Field(index=True)           # e.g. "CUST-001"
-    date:        str                                         # e.g. "2024-06-10"
-    subject:     str                                         # short description
-    category:    str                                         # billing_dispute | service_outage | etc.
-    priority:    str                                         # low | medium | high | critical
-    status:      str                                         # Open | In Progress | Resolved | Closed
-    assigned_to: str                                         # e.g. "Agent Sarah"
-    resolution:  Optional[str] = Field(default=None)        # filled when Resolved / Closed
-    last_update: str                                         # e.g. "2024-06-12"
+# ENUMS
+class TicketStatus(str, Enum):
+    open        = "open"
+    in_progress = "in_progress"
+    resolved    = "resolved"
+    closed      = "closed"
 
 
-class TicketNote(SQLModel, table=True):
-    id:        Optional[int] = Field(default=None, primary_key=True)
-    ticket_id: str           = Field(index=True)            # matches ComplaintTicket.ticket_id
-    date:      str                                          # e.g. "2024-06-10"
-    note:      str                                          # activity description
-    added_by:  str                                          # e.g. "Agent Sarah" | "System"
+# DB MODEL
+class Ticket(SQLModel, table=True):
+    id:          Optional[int]      = Field(default=None, primary_key=True)
+    title:       str
+    description: str
+    customer_id: str                = Field(index=True)
+    status:      TicketStatus       = Field(default=TicketStatus.open)
+
+    # Fields added for complaint agent context
+    category:    Optional[str]      = Field(default=None)
+    priority:    Optional[str]      = Field(default=None)
+    assigned_to: Optional[str]      = Field(default=None)
+
+    created_at:  datetime           = Field(default_factory=datetime.utcnow)
+    updated_at:  datetime           = Field(default_factory=datetime.utcnow)
+
+
+# REQUEST / RESPONSE SCHEMAS
+class TicketCreate(BaseModel):
+    title:       str
+    description: str
+    customer_id: str
+    category:    Optional[str] = None
+    priority:    Optional[str] = None
+    assigned_to: Optional[str] = None
+
+
+class TicketUpdate(BaseModel):
+    """Used for PATCH — all fields optional, only provided ones are updated."""
+    status:      Optional[TicketStatus] = None
+    category:    Optional[str]          = None
+    priority:    Optional[str]          = None
+    assigned_to: Optional[str]          = None
+
+
+class TicketResponse(BaseModel):
+    id:          int
+    title:       str
+    description: str
+    customer_id: str
+    status:      TicketStatus
+    category:    Optional[str]
+    priority:    Optional[str]
+    assigned_to: Optional[str]
+    created_at:  datetime
+    updated_at:  datetime
+
+    class Config:
+        from_attributes = True

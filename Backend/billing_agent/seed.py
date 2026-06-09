@@ -13,7 +13,6 @@ Idempotent — skips inserts if data for ACC-001 already exists.
 import sys
 from pathlib import Path
 
-# Allow running as a standalone script from the Backend directory
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from sqlmodel import Session, select
@@ -26,10 +25,7 @@ def seed() -> None:
 
     with Session(engine) as session:
 
-        # ── AccountBalance ───────────────────────────────────────────────────
-        existing_balance = session.exec(
-            select(AccountBalance).where(AccountBalance.account_id == "ACC-001")
-        ).first()
+        existing_balance = session.exec( select(AccountBalance).where(AccountBalance.account_id == "ACC-001")).first()
 
         if not existing_balance:
             session.add(
@@ -41,14 +37,11 @@ def seed() -> None:
                     last_payment="$245.00 on 2024-06-15",
                 )
             )
-            print("✔  Inserted AccountBalance for ACC-001")
+            print("Inserted AccountBalance for ACC-001")
         else:
-            print("⚠  AccountBalance for ACC-001 already exists — skipping")
+            print("AccountBalance for ACC-001 already exists — skipping")
 
-        # ── Invoices ─────────────────────────────────────────────────────────
-        existing_invoices = session.exec(
-            select(Invoice).where(Invoice.account_id == "ACC-001")
-        ).all()
+        existing_invoices = session.exec( select(Invoice).where(Invoice.account_id == "ACC-001") ).all()
 
         if not existing_invoices:
             invoices = [
@@ -60,14 +53,11 @@ def seed() -> None:
             ]
             for inv in invoices:
                 session.add(inv)
-            print(f"✔  Inserted {len(invoices)} invoices for ACC-001")
+            print(f"Inserted {len(invoices)} invoices for ACC-001")
         else:
-            print("⚠  Invoices for ACC-001 already exist — skipping")
+            print("Invoices for ACC-001 already exist — skipping")
 
-        # ── PaymentMethods ───────────────────────────────────────────────────
-        existing_methods = session.exec(
-            select(PaymentMethod).where(PaymentMethod.account_id == "ACC-001")
-        ).all()
+        existing_methods = session.exec( select(PaymentMethod).where(PaymentMethod.account_id == "ACC-001") ).all()
 
         if not existing_methods:
             methods = [
@@ -90,12 +80,12 @@ def seed() -> None:
             ]
             for method in methods:
                 session.add(method)
-            print(f"✔  Inserted {len(methods)} payment methods for ACC-001")
+            print(f"Inserted {len(methods)} payment methods for ACC-001")
         else:
-            print("⚠  PaymentMethods for ACC-001 already exist — skipping")
+            print("PaymentMethods for ACC-001 already exist — skipping")
 
         session.commit()
-        print("\n✅  Seed complete — billing.db is ready")
+        print("\n Seed complete — billing.db is ready")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,8 @@ from datetime import datetime
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from sqlmodel import Session, select
-from ticket_service.main import engine, Ticket, TicketStatus, on_startup
+from ticket_service.main import engine, on_startup
+from ticket_service.models import Ticket, TicketStatus
 
 
 # SAMPLE TICKETS

@@ -1,39 +1,36 @@
 import uuid
 import json
 import httpx
+import sys, os
+import uvicorn
+
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from typing import TypedDict, Literal, AsyncIterator
-
-import sys, os
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import AGENT_URLS, INTENT_DETECTOR_PORT
 from shared.llm import get_vertex_llm
 
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
 VALID_INTENTS = {"billing", "complaint", "sales"}
 
-
 # LANGGRAPH STATE
-
 class OrchestratorState(TypedDict):
     user_message:    str
-    detected_intent: str        # "billing" | "complaint" | "sales" | "unknown"
+    detected_intent: str
     target_agent:    AgentType
     a2a_response:    str
     request_id:      str
     final_response:  str
 
-
 # LLM
-
 llm = get_vertex_llm(temperature=0)
 
 
 # NODE 1 — Detect intent
-
 def detect_intent_node(state: OrchestratorState) -> OrchestratorState:
     """
     Uses LLM to classify the user message into one of:
@@ -72,8 +69,6 @@ def detect_intent_node(state: OrchestratorState) -> OrchestratorState:
 
 
 # NODE 2 — Dispatch to specialist agent via A2A HTTP call
-# Used only by the original blocking /chat endpoint — unchanged.
-
 async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
     """
     Builds an A2ARequest and POSTs it to the correct specialist agent.
@@ -91,11 +86,7 @@ async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
     try:
         async with httpx.AsyncClient() as client:
             url = AGENT_URLS[state["target_agent"]]
-            response = await client.post(
-                url,
-                json=req.model_dump(),
-                timeout=30.0,
-            )
+            response = await client.post( url,json=req.model_dump(), timeout=30.0, )
             response.raise_for_status()
             a2a_resp = A2AResponse(**response.json())
             return {**state, "a2a_response": a2a_resp.result}
@@ -132,7 +123,6 @@ async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
 
 
 # NODE 3 — Format final response back to the user
-
 def format_response_node(state: OrchestratorState) -> OrchestratorState:
     """
     Cleans and structures the final reply to the end user.
@@ -150,7 +140,6 @@ def format_response_node(state: OrchestratorState) -> OrchestratorState:
 
 
 # FALLBACK NODE — unknown intent
-
 def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
     return {
         **state,
@@ -162,7 +151,6 @@ def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
 
 
 # CONDITIONAL EDGE — route based on detected intent
-
 def route_intent(state: OrchestratorState) -> Literal["dispatch", "unknown_intent"]:
     if state["detected_intent"] in VALID_INTENTS:
         return "dispatch"
@@ -170,7 +158,6 @@ def route_intent(state: OrchestratorState) -> Literal["dispatch", "unknown_inten
 
 
 # BUILD GRAPH
-
 def build_orchestrator_graph() -> CompiledStateGraph:
     """
     Graph shape:
@@ -216,20 +203,9 @@ def build_orchestrator_graph() -> CompiledStateGraph:
 
 
 # SSE HELPER
-
 def _sse(event: str, data: dict) -> str:
-    """
-    Format a single SSE frame.
-    The double newline at the end is required by the SSE spec —
-    it signals the end of one event to the client.
-    """
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
-
-# STREAMING DISPATCH — used only by /chat/stream
-# Bypasses the LangGraph dispatch node entirely.
-# Calls detect_intent_node directly (blocking, ~1s), then opens an httpx
-# SSE stream to the specialist agent and forwards every line as-is.
 
 async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
     """
@@ -257,9 +233,6 @@ async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
       The graph is still used for the blocking /chat endpoint unchanged.
     """
 
-    # ── Phase 1: Intent detection ────────────────────────────────────────────
-    # Call detect_intent_node directly instead of going through ainvoke.
-    # This is the same function the graph calls — no duplication of logic.
     initial_state: OrchestratorState = {
         "user_message":    user_message,
         "detected_intent": "",
@@ -275,15 +248,12 @@ async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
     target     = state["target_agent"]
     request_id = state["request_id"]
 
-    # Immediately tell the client what we detected — they see this before
-    # any tokens arrive from the specialist agent.
     yield _sse("intent", {
         "intent":     intent,
         "agent":      target.value,
         "request_id": request_id,
     })
 
-    # ── Unknown intent early exit ────────────────────────────────────────────
     if intent not in VALID_INTENTS:
         yield _sse("error", {
             "message": (
@@ -293,7 +263,6 @@ async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
         })
         return
 
-    # ── Phase 2: Build A2ARequest and stream from specialist ─────────────────
     req = A2ARequest(
         request_id=request_id,
         source_agent=AgentType.INTENT_DETECTOR,
@@ -302,35 +271,18 @@ async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
         context={"detected_intent": intent},
     )
 
-    # Derive the streaming URL from AGENT_URLS.
-    # AGENT_URLS points to /process — replace with /process/stream.
-    base_url    = AGENT_URLS[target]                          # e.g. http://host:8002/process
+    base_url    = AGENT_URLS[target]
     stream_url  = base_url.replace("/process", "/process/stream")
 
     try:
         async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST",
-                stream_url,
-                json=req.model_dump(),
-                timeout=60.0,       # longer than specialist agent's own timeout
-            ) as response:
+            async with client.stream( "POST", stream_url, json=req.model_dump(),timeout=60.0,       ) as response:
                 response.raise_for_status()
 
-                # ── Phase 3: Passthrough ─────────────────────────────────────
-                # aiter_lines() yields one line at a time as the specialist
-                # pushes them. We forward each line directly — the specialist
-                # already formats them as valid SSE (event:, data:, blank).
-                # We re-add the newline that aiter_lines() strips.
                 async for line in response.aiter_lines():
                     if line:
-                        # Non-blank lines: forward with newline restored.
-                        # Blank lines (event boundary) are implicit — the next
-                        # non-blank line starts a new event frame.
                         yield line + "\n"
                     else:
-                        # Blank line = end of SSE event frame.
-                        # Must be forwarded so the client's SSE parser fires.
                         yield "\n"
 
     except httpx.ConnectError:
@@ -359,18 +311,10 @@ async def stream_from_orchestrator(user_message: str) -> AsyncIterator[str]:
 
 
 # FASTAPI
-
 app = FastAPI(title="Intent Detector — Orchestrator", version="1.0")
 orchestrator: CompiledStateGraph = build_orchestrator_graph()
 
 
-# -----------------------------------------------------------------------------
-# NEW — streaming endpoint
-# Runs intent detection then streams the specialist agent's SSE output
-# straight through to the client. The client sees one continuous stream
-# with events from both the orchestrator (intent) and the specialist
-# (tool_call, token, done / error).
-# -----------------------------------------------------------------------------
 @app.post("/chat/stream")
 async def chat_stream(payload: dict) -> StreamingResponse:
     """
@@ -379,10 +323,10 @@ async def chat_stream(payload: dict) -> StreamingResponse:
 
     Emits a continuous SSE stream:
       event: intent     — which agent was selected (from orchestrator)
-      event: tool_call  — a tool is being called  (forwarded from specialist)
+      event: tool_call  — a tool is being called   (forwarded from specialist)
       event: token      — one LLM output chunk     (forwarded from specialist)
-      event: done       — specialist finished       (forwarded from specialist)
-      event: error      — something went wrong      (orchestrator or specialist)
+      event: done       — specialist finished      (forwarded from specialist)
+      event: error      — something went wrong     (orchestrator or specialist)
     """
     return StreamingResponse(
         stream_from_orchestrator(payload["message"]),
@@ -391,9 +335,6 @@ async def chat_stream(payload: dict) -> StreamingResponse:
     )
 
 
-# -----------------------------------------------------------------------------
-# KEPT — original blocking endpoint, completely unchanged
-# -----------------------------------------------------------------------------
 @app.post("/chat")
 async def chat(payload: dict) -> dict:
     """
@@ -404,7 +345,7 @@ async def chat(payload: dict) -> dict:
     initial_state: OrchestratorState = {
         "user_message":    payload["message"],
         "detected_intent": "",
-        "target_agent":    AgentType.BILLING,   # placeholder, overwritten by detect_intent_node
+        "target_agent":    AgentType.BILLING,
         "a2a_response":    "",
         "request_id":      "",
         "final_response":  "",
@@ -426,7 +367,6 @@ def health():
 
 
 if __name__ == "__main__":
-    import uvicorn
 
     uvicorn.run(
         "intent_detector.main:app",
