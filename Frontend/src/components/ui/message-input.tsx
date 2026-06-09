@@ -16,7 +16,7 @@ interface MessageInputProps
 }
 
 export function MessageInput({
-  placeholder = "Ask AI...",
+  placeholder = "Ask about billing, sales, or complaints...",
   className,
   onKeyDown: onKeyDownProp,
   submitOnEnter = true,

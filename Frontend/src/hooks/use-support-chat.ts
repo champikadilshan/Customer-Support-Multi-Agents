@@ -21,13 +21,13 @@ const INITIAL_MESSAGES: Message[] = [
   {
     id: "demo-1",
     role: "user",
-    content: "What is shadcn-chatbot-kit?",
+    content: "Do you need any help?",
   },
   {
     id: "demo-2",
     role: "assistant",
     content:
-      "shadcn-chatbot-kit is a toolkit to easily build chatbot UIs. It is a set of beautifully designed components based on shadcn/ui. It is fully customizable and owned by you.",
+      "Customer support agent is an AI-powered platform. It routes your requests to billing, sales, or complaint specialists.",
   },
 ]
 

@@ -19,11 +19,11 @@ export default function Home() {
           <div className="flex flex-col">
             <PageHeader className="pb-4 pt-0 md:pb-6 md:pt-0">
               <PageHeaderHeading>
-                Build beautiful AI apps in hours, not days.
+                Customer support that feels human, powered by AI.
               </PageHeaderHeading>
               <PageHeaderDescription>
-                Beautifully designed chatbot components based on shadcn/ui.
-                Fully customizable and owned by you.
+                Ask about billing, explore products, or raise a complaint our
+                multi-agent system routes you to the right specialist instantly.
               </PageHeaderDescription>
               <PageActions>
                 <Button size="sm">Get Started</Button>
