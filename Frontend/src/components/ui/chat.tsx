@@ -1,10 +1,11 @@
 "use client"
 
-import { forwardRef, useCallback } from "react"
+import { forwardRef, useCallback, useEffect } from "react"
 import { ArrowDown } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { useAutoScroll } from "@/hooks/use-auto-scroll"
+import { getAgentStatusMessage } from "@/lib/agent-status"
 import { Button } from "@/components/ui/button"
 import { type Message } from "@/components/ui/chat-message"
 import { CopyButton } from "@/components/ui/copy-button"
@@ -19,6 +20,8 @@ interface ChatPropsBase {
   className?: string
   handleInputChange: React.ChangeEventHandler<HTMLTextAreaElement>
   isGenerating: boolean
+  activeAgent?: string | null
+  activeIntent?: string | null
   stop?: () => void
 }
 
@@ -41,24 +44,40 @@ export function Chat({
   handleInputChange,
   stop,
   isGenerating,
+  activeAgent = null,
+  activeIntent = null,
   append,
   suggestions,
   className,
 }: ChatProps) {
   const lastMessage = messages.at(-1)
   const isEmpty = messages.length === 0
-  const isTyping = lastMessage?.role === "user"
 
   const messageOptions = useCallback(
-    (message: Message) => ({
-      actions: (
-        <CopyButton
-          content={message.content}
-          copyMessage="Copied response to clipboard!"
-        />
-      ),
-    }),
-    []
+    (message: Message) => {
+      const isLastAssistant =
+        message.id === lastMessage?.id && message.role === "assistant"
+      const hasActiveToolCall = message.toolInvocations?.some(
+        (invocation) => invocation.state === "call"
+      )
+
+      return {
+        actions: (
+          <CopyButton
+            content={message.content}
+            copyMessage="Copied response to clipboard!"
+          />
+        ),
+        isStreaming: isGenerating && isLastAssistant,
+        enableTypewriter: Boolean(isLastAssistant && message.createdAt),
+        statusMessage: getAgentStatusMessage({
+          activeAgent,
+          activeIntent,
+          hasActiveToolCall: Boolean(hasActiveToolCall),
+        }),
+      }
+    },
+    [activeAgent, activeIntent, isGenerating, lastMessage?.id]
   )
 
   return (
@@ -72,10 +91,9 @@ export function Chat({
       ) : null}
 
       {messages.length > 0 ? (
-        <ChatMessages messages={messages}>
+        <ChatMessages isGenerating={isGenerating} messages={messages}>
           <MessageList
             messages={messages}
-            isTyping={isTyping}
             showTimeStamps={false}
             messageOptions={messageOptions}
           />
@@ -103,8 +121,10 @@ export function Chat({
 export function ChatMessages({
   messages,
   children,
+  isGenerating = false,
 }: React.PropsWithChildren<{
   messages: Message[]
+  isGenerating?: boolean
 }>) {
   const {
     containerRef,
@@ -112,7 +132,14 @@ export function ChatMessages({
     handleScroll,
     shouldAutoScroll,
     handleTouchStart,
-  } = useAutoScroll([messages])
+  } = useAutoScroll([messages, isGenerating])
+
+  useEffect(() => {
+    if (!isGenerating || !shouldAutoScroll) return
+
+    const intervalId = window.setInterval(scrollToBottom, 48)
+    return () => window.clearInterval(intervalId)
+  }, [isGenerating, shouldAutoScroll, scrollToBottom])
 
   return (
     <div
