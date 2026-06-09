@@ -1,6 +1,7 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
+import { toast } from "sonner"
 
 import { fetchTickets, type Ticket } from "@/lib/tickets"
 
@@ -10,11 +11,24 @@ export function useTickets() {
   const [tickets, setTickets] = useState<Ticket[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const knownTicketIdsRef = useRef<Set<number>>(new Set())
 
   const loadTickets = useCallback(async () => {
     try {
       setError(null)
       const data = await fetchTickets()
+      const knownIds = knownTicketIdsRef.current
+
+      if (knownIds.size > 0) {
+        const newTicket = data.find((ticket) => !knownIds.has(ticket.id))
+        if (newTicket) {
+          toast.success("Ticket created", {
+            description: `Ticket #${newTicket.id} · ${newTicket.title}`,
+          })
+        }
+      }
+
+      knownTicketIdsRef.current = new Set(data.map((ticket) => ticket.id))
       setTickets(data)
     } catch {
       setError("Unable to load tickets right now.")

@@ -204,6 +204,7 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
 
   function renderHitlCard() {
     if (!hitlRequest) return null
+    if (hitlResponse && content) return null
 
     return (
       <HitlConfirmationCard

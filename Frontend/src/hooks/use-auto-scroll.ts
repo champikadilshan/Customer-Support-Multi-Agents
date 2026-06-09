@@ -1,18 +1,28 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 const ACTIVATION_THRESHOLD = 50
 const MIN_SCROLL_UP_THRESHOLD = 10
 
 export function useAutoScroll(dependencies: React.DependencyList) {
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const contentRef = useRef<HTMLDivElement | null>(null)
   const previousScrollTop = useRef<number | null>(null)
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true)
 
-  const scrollToBottom = () => {
-    if (containerRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight
-    }
-  }
+  const scrollToBottom = useCallback(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    container.scrollTop = container.scrollHeight
+  }, [])
+
+  const scrollToBottomSoon = useCallback(() => {
+    scrollToBottom()
+    requestAnimationFrame(() => {
+      scrollToBottom()
+      requestAnimationFrame(scrollToBottom)
+    })
+  }, [scrollToBottom])
 
   const handleScroll = () => {
     if (!containerRef.current) return
@@ -51,14 +61,30 @@ export function useAutoScroll(dependencies: React.DependencyList) {
 
   useEffect(() => {
     if (shouldAutoScroll) {
-      scrollToBottom()
+      scrollToBottomSoon()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, dependencies)
 
+  useEffect(() => {
+    const container = containerRef.current
+    const content = contentRef.current
+    if (!container || !content || !shouldAutoScroll) return
+
+    const observer = new ResizeObserver(() => {
+      scrollToBottomSoon()
+    })
+
+    observer.observe(content)
+    observer.observe(container)
+
+    return () => observer.disconnect()
+  }, [shouldAutoScroll, scrollToBottomSoon])
+
   return {
     containerRef,
-    scrollToBottom,
+    contentRef,
+    scrollToBottom: scrollToBottomSoon,
     handleScroll,
     shouldAutoScroll,
     handleTouchStart,

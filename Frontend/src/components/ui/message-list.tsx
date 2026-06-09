@@ -20,7 +20,7 @@ export function MessageList({
   messageOptions,
 }: MessageListProps) {
   return (
-    <div className="space-y-4 overflow-visible">
+    <div className="space-y-4">
       {messages.map((message) => {
         const additionalOptions =
           typeof messageOptions === "function"
