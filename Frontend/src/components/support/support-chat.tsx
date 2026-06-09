@@ -16,6 +16,8 @@ export function SupportChat() {
     append,
     stop,
     isGenerating,
+    activeAgent,
+    activeIntent,
     hitlRequest,
     respondToHitl,
     suggestions,
@@ -33,6 +35,8 @@ export function SupportChat() {
           append={append}
           suggestions={suggestions}
           isGenerating={isGenerating}
+          activeAgent={activeAgent}
+          activeIntent={activeIntent}
           stop={stop}
         />
       </div>
