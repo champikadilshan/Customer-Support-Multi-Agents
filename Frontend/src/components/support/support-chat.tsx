@@ -12,14 +12,12 @@ export function SupportChat() {
     input,
     handleInputChange,
     handleSubmit,
-    append,
     stop,
     isGenerating,
     isHitlPending,
     activeAgent,
     activeIntent,
     respondToHitl,
-    suggestions,
   } = useSupportChat()
 
   return (
@@ -31,8 +29,6 @@ export function SupportChat() {
           input={input}
           handleInputChange={handleInputChange}
           handleSubmit={handleSubmit}
-          append={append}
-          suggestions={suggestions}
           isGenerating={isGenerating}
           isHitlPending={isHitlPending}
           activeAgent={activeAgent}

@@ -1,55 +1,32 @@
 "use client"
 
 import { useCallback, useMemo, useRef, useState } from "react"
+import { toast } from "sonner"
 
 import { type Message } from "@/components/ui/chat-message"
+import { useAgentTrace, readStoredSessionId, SESSION_STORAGE_KEY } from "@/hooks/use-agent-trace"
 import { refreshTicketsPanel } from "@/hooks/use-tickets"
-import {
-  createInitialAgentGraphState,
-  reduceAgentGraphOnDone,
-  reduceAgentGraphOnError,
-  reduceAgentGraphOnHitlRequest,
-  reduceAgentGraphOnHitlResponse,
-  reduceAgentGraphOnIntent,
-  reduceAgentGraphOnStreamStart,
-  reduceAgentGraphOnToken,
-  reduceAgentGraphOnToolCall,
-} from "@/lib/agent-graph"
 import { consumeSseStream, type SseEvent } from "@/lib/sse"
 
 export type { HitlRequest } from "@/lib/hitl"
-
-const INITIAL_MESSAGES: Message[] = [
-  {
-    id: "demo-1",
-    role: "user",
-    content: "Greetings! Let's start chatting",
-  },
-  {
-    id: "demo-2",
-    role: "assistant",
-    content:
-      "Customer support agent is an AI-powered platform. It routes your requests to billing, sales, or complaint specialists.",
-  },
-]
-
-const SUPPORT_SUGGESTIONS = [
-  "What is my current account balance?",
-  "I want to raise a complaint about my recent order",
-  "What laptops do you have under $1000?",
-]
 
 function createId() {
   return crypto.randomUUID()
 }
 
+function persistSessionId(sessionId: string) {
+  localStorage.setItem(SESSION_STORAGE_KEY, sessionId)
+}
+
 export function useSupportChat() {
-  const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES)
+  const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
   const [isGenerating, setIsGenerating] = useState(false)
+  const [isResetting, setIsResetting] = useState(false)
   const [activeAgent, setActiveAgent] = useState<string | null>(null)
   const [activeIntent, setActiveIntent] = useState<string | null>(null)
-  const [agentGraph, setAgentGraph] = useState(createInitialAgentGraphState)
+  const [sessionId, setSessionId] = useState<string | null>(readStoredSessionId)
+  const { agentGraph, resetGraph, connectTrace } = useAgentTrace(sessionId)
   const abortRef = useRef<AbortController | null>(null)
   const assistantIdRef = useRef<string | null>(null)
 
@@ -58,7 +35,13 @@ export function useSupportChat() {
     [messages]
   )
 
-  const isGraphLive = isGenerating || isHitlPending
+  const isGraphLive = useMemo(() => {
+    if (isGenerating || isHitlPending) return true
+
+    return Object.values(agentGraph.nodes).some(
+      (node) => node.status === "active" || node.status === "waiting"
+    )
+  }, [agentGraph.nodes, isGenerating, isHitlPending])
 
   const handleInputChange = useCallback(
     (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -72,6 +55,14 @@ export function useSupportChat() {
     abortRef.current = null
     setIsGenerating(false)
   }, [])
+
+  const clearLocalChatState = useCallback(() => {
+    setMessages([])
+    setInput("")
+    setActiveAgent(null)
+    setActiveIntent(null)
+    resetGraph()
+  }, [resetGraph])
 
   const updateAssistantMessage = useCallback(
     (assistantId: string, updater: (message: Message) => Message) => {
@@ -87,22 +78,20 @@ export function useSupportChat() {
   const handleStreamEvent = useCallback(
     (assistantId: string, event: SseEvent) => {
       switch (event.type) {
+        case "session": {
+          const sid = event.data.session_id
+          persistSessionId(sid)
+          setSessionId(sid)
+          connectTrace(sid)
+          break
+        }
+
         case "intent":
           setActiveIntent(event.data.intent)
           setActiveAgent(event.data.agent)
-          setAgentGraph((current) =>
-            reduceAgentGraphOnIntent(
-              current,
-              event.data.intent,
-              event.data.agent
-            )
-          )
           break
 
         case "tool_call":
-          setAgentGraph((current) =>
-            reduceAgentGraphOnToolCall(current, event.data.tool)
-          )
           updateAssistantMessage(assistantId, (message) => {
             const existing = message.toolInvocations ?? []
             const completed = existing.map((tool) =>
@@ -126,7 +115,6 @@ export function useSupportChat() {
           break
 
         case "token":
-          setAgentGraph((current) => reduceAgentGraphOnToken(current))
           updateAssistantMessage(assistantId, (message) => ({
             ...message,
             content: message.content + event.data.text,
@@ -134,7 +122,6 @@ export function useSupportChat() {
           break
 
         case "hitl_request":
-          setAgentGraph((current) => reduceAgentGraphOnHitlRequest(current))
           updateAssistantMessage(assistantId, (message) => ({
             ...message,
             hitlRequest: event.data,
@@ -142,9 +129,6 @@ export function useSupportChat() {
           break
 
         case "error":
-          setAgentGraph((current) =>
-            reduceAgentGraphOnError(current, event.data.message)
-          )
           updateAssistantMessage(assistantId, (message) => ({
             ...message,
             content: message.content || event.data.message,
@@ -152,7 +136,6 @@ export function useSupportChat() {
           break
 
         case "done":
-          setAgentGraph((current) => reduceAgentGraphOnDone(current))
           updateAssistantMessage(assistantId, (message) => {
             const completedTools = message.toolInvocations?.map((tool) =>
               tool.state === "call"
@@ -173,7 +156,7 @@ export function useSupportChat() {
           break
       }
     },
-    [updateAssistantMessage]
+    [connectTrace, updateAssistantMessage]
   )
 
   const streamMessage = useCallback(
@@ -198,8 +181,11 @@ export function useSupportChat() {
       setMessages((current) => [...current, userMessage, assistantMessage])
       setActiveAgent(null)
       setActiveIntent(null)
-      setAgentGraph(reduceAgentGraphOnStreamStart)
       setIsGenerating(true)
+
+      if (sessionId) {
+        connectTrace(sessionId)
+      }
 
       const controller = new AbortController()
       abortRef.current = controller
@@ -207,18 +193,15 @@ export function useSupportChat() {
       try {
         await consumeSseStream(
           url,
-          { message },
+          {
+            message,
+            session_id: sessionId,
+          },
           (event) => handleStreamEvent(assistantId, event),
           controller.signal
         )
       } catch (error) {
         if ((error as Error).name !== "AbortError") {
-          setAgentGraph((current) =>
-            reduceAgentGraphOnError(
-              current,
-              "Something went wrong while contacting support."
-            )
-          )
           updateAssistantMessage(assistantId, (current) => ({
             ...current,
             content:
@@ -231,18 +214,18 @@ export function useSupportChat() {
         setIsGenerating(false)
       }
     },
-    [handleStreamEvent, updateAssistantMessage]
+    [connectTrace, handleStreamEvent, sessionId, updateAssistantMessage]
   )
 
   const sendMessage = useCallback(
     async (content: string) => {
       const trimmed = content.trim()
-      if (!trimmed || isGenerating || isHitlPending) return
+      if (!trimmed || isGenerating || isHitlPending || isResetting) return
 
       setInput("")
       await streamMessage(trimmed)
     },
-    [isGenerating, isHitlPending, streamMessage]
+    [isGenerating, isHitlPending, isResetting, streamMessage]
   )
 
   const handleSubmit = useCallback(
@@ -253,12 +236,33 @@ export function useSupportChat() {
     [input, sendMessage]
   )
 
-  const append = useCallback(
-    (message: { role: "user"; content: string }) => {
-      void sendMessage(message.content)
-    },
-    [sendMessage]
-  )
+  const resetSession = useCallback(async () => {
+    if (isGenerating || isHitlPending || isResetting) return
+
+    stop()
+    setIsResetting(true)
+
+    try {
+      if (sessionId) {
+        const response = await fetch("/api/session/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        })
+
+        if (!response.ok) {
+          throw new Error("Failed to reset session")
+        }
+      }
+
+      clearLocalChatState()
+      toast.success("Chat session reset")
+    } catch {
+      toast.error("Could not reset the chat session")
+    } finally {
+      setIsResetting(false)
+    }
+  }, [clearLocalChatState, isGenerating, isHitlPending, isResetting, sessionId, stop])
 
   const respondToHitl = useCallback(
     async (messageId: string, response: "yes" | "no") => {
@@ -275,10 +279,11 @@ export function useSupportChat() {
             : message
         )
       )
-      setAgentGraph((current) =>
-        reduceAgentGraphOnHitlResponse(current, response)
-      )
       setIsGenerating(true)
+
+      if (sessionId) {
+        connectTrace(sessionId)
+      }
 
       const controller = new AbortController()
       abortRef.current = controller
@@ -292,12 +297,6 @@ export function useSupportChat() {
         )
       } catch (error) {
         if ((error as Error).name !== "AbortError") {
-          setAgentGraph((current) =>
-            reduceAgentGraphOnError(
-              current,
-              "Failed to resume the complaint flow."
-            )
-          )
           updateAssistantMessage(messageId, (current) => ({
             ...current,
             content:
@@ -310,7 +309,7 @@ export function useSupportChat() {
         setIsGenerating(false)
       }
     },
-    [handleStreamEvent, messages, updateAssistantMessage]
+    [connectTrace, handleStreamEvent, messages, sessionId, updateAssistantMessage]
   )
 
   return {
@@ -318,14 +317,14 @@ export function useSupportChat() {
     input,
     handleInputChange,
     handleSubmit,
-    append,
     stop,
+    resetSession,
     isGenerating,
+    isResetting,
     isHitlPending,
     activeAgent,
     activeIntent,
     respondToHitl,
-    suggestions: SUPPORT_SUGGESTIONS,
     agentGraph,
     isGraphLive,
   }

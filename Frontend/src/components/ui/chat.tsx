@@ -11,9 +11,9 @@ import { type Message } from "@/components/ui/chat-message"
 import { CopyButton } from "@/components/ui/copy-button"
 import { MessageInput } from "@/components/ui/message-input"
 import { MessageList } from "@/components/ui/message-list"
-import { PromptSuggestions } from "@/components/ui/prompt-suggestions"
+import { ChatEmptyState } from "@/components/ui/chat-empty-state"
 
-interface ChatPropsBase {
+interface ChatProps {
   handleSubmit: (event?: { preventDefault?: () => void }) => void
   messages: Message[]
   input: string
@@ -27,18 +27,6 @@ interface ChatPropsBase {
   stop?: () => void
 }
 
-interface ChatPropsWithoutSuggestions extends ChatPropsBase {
-  append?: never
-  suggestions?: never
-}
-
-interface ChatPropsWithSuggestions extends ChatPropsBase {
-  append: (message: { role: "user"; content: string }) => void
-  suggestions: string[]
-}
-
-type ChatProps = ChatPropsWithoutSuggestions | ChatPropsWithSuggestions
-
 export function Chat({
   messages,
   handleSubmit,
@@ -50,8 +38,6 @@ export function Chat({
   activeAgent = null,
   activeIntent = null,
   respondToHitl,
-  append,
-  suggestions,
   className,
 }: ChatProps) {
   const lastMessage = messages.at(-1)
@@ -96,13 +82,7 @@ export function Chat({
 
   return (
     <ChatContainer className={className}>
-      {isEmpty && append && suggestions ? (
-        <PromptSuggestions
-          label="How can we help you today?"
-          append={append}
-          suggestions={suggestions}
-        />
-      ) : null}
+      {isEmpty ? <ChatEmptyState /> : null}
 
       {messages.length > 0 ? (
         <ChatMessages

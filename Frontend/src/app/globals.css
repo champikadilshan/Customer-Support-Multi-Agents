@@ -78,4 +78,23 @@
   .scrollbar-hidden::-webkit-scrollbar {
     display: none;
   }
+
+  .agent-flow-canvas .react-flow__node {
+    pointer-events: none;
+    overflow: visible;
+  }
+
+  .agent-flow-canvas .react-flow__node > div {
+    overflow: hidden;
+  }
+
+  .agent-flow-canvas .react-flow__edge-path {
+    pointer-events: none;
+  }
+
+  .agent-flow-canvas,
+  .agent-flow-canvas .react-flow {
+    height: 100%;
+    width: 100%;
+  }
 }

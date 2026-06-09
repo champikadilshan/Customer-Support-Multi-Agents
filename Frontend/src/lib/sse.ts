@@ -1,4 +1,5 @@
 export type SseEvent =
+  | { type: "session"; data: { session_id: string } }
   | { type: "intent"; data: { intent: string; agent: string; request_id: string } }
   | { type: "tool_call"; data: { tool: string } }
   | { type: "token"; data: { text: string } }
