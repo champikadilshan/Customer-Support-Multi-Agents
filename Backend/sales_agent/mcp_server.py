@@ -10,24 +10,21 @@ Start with:
 The server listens on SALES_MCP_PORT (default 8005).
 The SSE endpoint the agent connects to is: http://localhost:8005/sse
 """
-
 import sys, os
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+import uvicorn
 
 from mcp.server.fastmcp import FastMCP
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError
 from shared.config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, SALES_MCP_PORT
 
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# NEO4J DRIVER — created once at module level, reused across all tool calls
-
+# NEO4J DRIVER — created once reused across all tool calls
 try:
-    driver = GraphDatabase.driver(
-        NEO4J_URI,
-        auth=(NEO4J_USERNAME, NEO4J_PASSWORD),
-    )
+    driver = GraphDatabase.driver(NEO4J_URI,auth=(NEO4J_USERNAME, NEO4J_PASSWORD),)
     driver.verify_connectivity()
+
     print(f"Connected to Neo4j at {NEO4J_URI}")
 except (ServiceUnavailable, AuthError) as e:
     print(f"WARNING: Could not connect to Neo4j at startup: {e}")
@@ -48,15 +45,11 @@ def run_query(cypher: str, params: dict = {}) -> list[dict]:
         return [dict(record) for record in result]
 
 
-# MCP SERVER
-# Tools defined here — NOT in the agent.
-# The LLM discovers these automatically when the agent connects via SSE.
-
+# MCP SERVER | Tools defined here — NOT in the agent, The LLM discovers these automatically when the agent connects via SSE.
 mcp = FastMCP("Sales MCP")
 
 
 # TOOL 1 — Product catalogue
-
 @mcp.tool()
 def get_product_catalog(category: str) -> list[dict]:
     """
@@ -74,6 +67,7 @@ def get_product_catalog(category: str) -> list[dict]:
                 ORDER BY c.id, p.id
             """
             params = {}
+
         else:
             cypher = """
                 MATCH (p:Product)-[:BELONGS_TO]->(c:Category {id: $category})
@@ -95,7 +89,6 @@ def get_product_catalog(category: str) -> list[dict]:
 
 
 # TOOL 2 — Active promotions
-
 @mcp.tool()
 def get_active_promotions(product_id: str = "") -> list[dict]:
     """
@@ -115,6 +108,7 @@ def get_active_promotions(product_id: str = "") -> list[dict]:
                 ORDER BY promo.id
             """
             params = {"product_id": product_id}
+
         else:
             cypher = """
                 MATCH (promo:Promotion)-[:APPLIES_TO]->(p:Product)
@@ -139,7 +133,6 @@ def get_active_promotions(product_id: str = "") -> list[dict]:
 
 
 # TOOL 3 — Product availability
-
 @mcp.tool()
 def check_product_availability(product_id: str) -> dict:
     """
@@ -177,18 +170,10 @@ def check_product_availability(product_id: str) -> dict:
 
 
 # ASGI APP — expose the FastMCP SSE app for uvicorn
-#
-# Run with:
-#     uvicorn sales_agent.mcp_server:app --port $SALES_MCP_PORT
-# Or directly:
-#     python sales_agent/mcp_server.py
-
-# FastMCP exposes its SSE ASGI app via .sse_app()
-# This is what uvicorn needs to find when you pass "mcp_server:app"
 app = mcp.sse_app()
 
 if __name__ == "__main__":
-    import uvicorn
     print(f"Starting Sales MCP Server on port {SALES_MCP_PORT}...")
     print(f"Agent should connect to: http://localhost:{SALES_MCP_PORT}/sse")
+
     uvicorn.run(app, host="0.0.0.0", port=SALES_MCP_PORT)

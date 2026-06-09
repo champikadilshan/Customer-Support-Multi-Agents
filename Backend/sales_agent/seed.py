@@ -6,18 +6,15 @@ Run once after creating your AuraDB instance:
 
 Uses MERGE so re-running is safe — no duplicate nodes or relationships.
 """
-
 import sys
+
 from pathlib import Path
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
 from neo4j import GraphDatabase
 from shared.config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 # DRIVER
-
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
 
 
@@ -26,7 +23,6 @@ def run(session, cypher: str, params: dict = {}) -> None:
 
 
 # SEED DATA
-
 def seed_categories(session) -> None:
     categories = [
         {"id": "internet", "name": "Internet Plans"},
@@ -34,17 +30,14 @@ def seed_categories(session) -> None:
         {"id": "tv",       "name": "TV Plans"},
         {"id": "bundle",   "name": "Bundles"},
     ]
-    for cat in categories:
-        run(session,
-            "MERGE (c:Category {id: $id}) SET c.name = $name",
-            cat,
-        )
-    print(f"  Merged {len(categories)} Category nodes")
 
+    for cat in categories:
+        run(session, "MERGE (c:Category {id: $id}) SET c.name = $name",  cat, )
+
+    print(f"  Merged {len(categories)} Category nodes")
 
 def seed_products(session) -> None:
     products = [
-        # Internet
         {
             "id": "INT-001", "name": "Fiber Basic",
             "speed": "100 Mbps", "price": "$39.99/mo",
@@ -66,7 +59,6 @@ def seed_products(session) -> None:
             "available": True, "activation": "Next business day",
             "contract": "12-month option for discount", "category": "internet",
         },
-        # Mobile
         {
             "id": "MOB-001", "name": "Starter SIM",
             "data": "5 GB", "price": "$15.00/mo",
@@ -88,7 +80,6 @@ def seed_products(session) -> None:
             "available": True, "activation": "SIM delivered in 2-3 days",
             "contract": "No contract", "category": "mobile",
         },
-        # TV
         {
             "id": "TV-001", "name": "Basic TV",
             "channels": "50+", "price": "$25.00/mo",
@@ -110,7 +101,6 @@ def seed_products(session) -> None:
             "available": False, "activation": "Coming soon",
             "contract": "N/A", "category": "tv",
         },
-        # Bundles
         {
             "id": "BND-001", "name": "Home Bundle",
             "price": "$54.99/mo", "saving": "Save $10/mo",
@@ -129,6 +119,7 @@ def seed_products(session) -> None:
 
     for p in products:
         category = p.pop("category")
+
         # Merge product node
         run(session,
             """
@@ -137,6 +128,7 @@ def seed_products(session) -> None:
             """,
             {"id": p["id"], "props": p},
         )
+
         # Merge BELONGS_TO relationship
         run(session,
             """
@@ -159,6 +151,7 @@ def seed_bundles(session) -> None:
         ("BND-002", "TV-002"),
         ("BND-002", "MOB-002"),
     ]
+
     for bundle_id, component_id in includes:
         run(session,
             """
@@ -168,6 +161,7 @@ def seed_bundles(session) -> None:
             """,
             {"bid": bundle_id, "cid": component_id},
         )
+
     print(f"  Merged {len(includes)} INCLUDES relationships")
 
 
@@ -179,6 +173,7 @@ def seed_compatible_with(session) -> None:
         ("INT-001", "TV-001"),    # Fiber Basic + Basic TV
         ("INT-002", "TV-002"),    # Fiber Pro + Entertainment
     ]
+
     for a, b in pairs:
         run(session,
             """
@@ -223,7 +218,6 @@ def seed_promotions(session) -> None:
     for promo in promotions:
         applies_to = promo.pop("applies_to")
 
-        # Merge promotion node
         run(session,
             """
             MERGE (promo:Promotion {id: $id})
@@ -232,7 +226,6 @@ def seed_promotions(session) -> None:
             {"id": promo["id"], "props": promo},
         )
 
-        # Merge APPLIES_TO relationships
         for product_id in applies_to:
             run(session,
                 """
@@ -247,8 +240,8 @@ def seed_promotions(session) -> None:
 
 
 # MAIN
-
 def seed() -> None:
+
     print("Connecting to Neo4j...")
     driver.verify_connectivity()
     print("Connected.\n")

@@ -17,8 +17,7 @@ COMPLAINT_AGENT_PORT = int(os.getenv("COMPLAINT_AGENT_PORT", "8003"))
 SALES_AGENT_PORT     = int(os.getenv("SALES_AGENT_PORT",     "8004"))
 SALES_MCP_PORT       = int(os.getenv("SALES_MCP_PORT",       "8005"))
 
-# Neo4j AuraDB — credentials from .env
-# Get these from your AuraDB instance dashboard at neo4j.io/aura
+
 NEO4J_URI      = os.getenv("NEO4J_URI", "neo4j+s://xxxx.databases.neo4j.io")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
