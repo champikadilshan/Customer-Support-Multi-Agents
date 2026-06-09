@@ -73,9 +73,38 @@ const config: Config = {
           "0%,40%": { transform: "translateY(0)" },
           "20%": { transform: "translateY(-0.25rem)" },
         },
+        "orb-float": {
+          "0%, 100%": { transform: "translateY(0)" },
+          "50%": { transform: "translateY(-6px)" },
+        },
+        "orb-glow": {
+          "0%, 100%": { opacity: "0.45", transform: "scale(0.96)" },
+          "50%": { opacity: "0.9", transform: "scale(1.04)" },
+        },
+        "orb-shimmer": {
+          "0%": { transform: "rotate(0deg)" },
+          "100%": { transform: "rotate(360deg)" },
+        },
+        sparkle: {
+          "0%, 100%": { opacity: "0", transform: "scale(0.4)" },
+          "50%": { opacity: "1", transform: "scale(1)" },
+        },
+        "edge-flow": {
+          "0%": { strokeDashoffset: "20" },
+          "100%": { strokeDashoffset: "0" },
+        },
+        "flow-dot": {
+          "0%": { offsetDistance: "0%" },
+          "100%": { offsetDistance: "100%" },
+        },
       },
       animation: {
         "typing-dot-bounce": "typing-dot-bounce 1.25s ease-out infinite",
+        "orb-float": "orb-float 5s ease-in-out infinite",
+        "orb-glow": "orb-glow 4s ease-in-out infinite",
+        "orb-shimmer": "orb-shimmer 8s linear infinite",
+        sparkle: "sparkle 3s ease-in-out infinite",
+        "edge-flow": "edge-flow 0.8s linear infinite",
       },
     },
   },

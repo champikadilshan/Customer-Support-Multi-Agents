@@ -3,9 +3,14 @@ export type AgentNodeId =
   | "billing"
   | "complaint"
   | "sales"
-  | "tools"
   | "hitl"
-  | "ticket_service"
+  | "billing_db"
+  | "sales_mcp"
+  | "product_db"
+  | "ticket_api"
+  | "ticket_db"
+
+export type NodeKind = "orchestrator" | "agent" | "infra"
 
 export type NodeStatus =
   | "idle"
@@ -16,10 +21,26 @@ export type NodeStatus =
 
 export type EdgeStatus = "idle" | "active" | "completed"
 
+export type GraphNodeState = {
+  status: NodeStatus
+  detail?: string
+  runningTools: string[]
+  completedTools: string[]
+}
+
 export type GraphEdge = {
+  id: string
   from: AgentNodeId
   to: AgentNodeId
   status: EdgeStatus
+  kind: "route" | "collaboration" | "data" | "pipeline"
+}
+
+export type GraphHandoff = {
+  from: string
+  to: string
+  status: EdgeStatus
+  reason?: string
 }
 
 export type GraphActivity = {
@@ -29,65 +50,113 @@ export type GraphActivity = {
 }
 
 export type AgentGraphState = {
-  nodes: Record<AgentNodeId, { status: NodeStatus; detail?: string }>
+  nodes: Record<AgentNodeId, GraphNodeState>
   edges: GraphEdge[]
+  handoffs: GraphHandoff[]
   activities: GraphActivity[]
   routedAgent: AgentNodeId | null
   showComplaintFlow: boolean
+  traceConnected: boolean
+  lastEventAt: number | null
+}
+
+export const NODE_KIND: Record<AgentNodeId, NodeKind> = {
+  intent_detector: "orchestrator",
+  billing: "agent",
+  complaint: "agent",
+  sales: "agent",
+  hitl: "infra",
+  billing_db: "infra",
+  sales_mcp: "infra",
+  product_db: "infra",
+  ticket_api: "infra",
+  ticket_db: "infra",
 }
 
 export const AGENT_NODES: Record<
   AgentNodeId,
-  { label: string; description: string }
+  { label: string; description: string; subtitle?: string }
 > = {
   intent_detector: {
     label: "Intent Detector",
-    description: "Routes your message to the right specialist",
+    description: "Orchestrator · routes by intent",
+    subtitle: ":8001",
   },
   billing: {
     label: "Billing Agent",
-    description: "Account balance, invoices, payments",
+    description: "Balance, invoices, payments",
+    subtitle: ":8002",
   },
   complaint: {
     label: "Complaint Agent",
-    description: "Issues, disputes, ticket staging",
+    description: "Issues, tickets, disputes",
+    subtitle: ":8003",
   },
   sales: {
     label: "Sales Agent",
     description: "Products, plans, promotions",
-  },
-  tools: {
-    label: "Tools",
-    description: "Backend tool calls",
+    subtitle: ":8004",
   },
   hitl: {
     label: "Human Review",
-    description: "Approval before ticket creation",
+    description: "Approval gate before ticket create",
   },
-  ticket_service: {
+  billing_db: {
+    label: "Billing DB",
+    description: "SQLite · accounts & invoices",
+  },
+  sales_mcp: {
+    label: "Sales MCP",
+    description: "MCP product tools",
+    subtitle: ":8005",
+  },
+  product_db: {
+    label: "Product Graph",
+    description: "Neo4j catalog",
+  },
+  ticket_api: {
     label: "Ticket Service",
-    description: "Persists support tickets",
+    description: "REST API · ticket CRUD",
+    subtitle: ":8000",
+  },
+  ticket_db: {
+    label: "Ticket DB",
+    description: "SQLite · support tickets",
   },
 }
 
 const BASE_EDGES: GraphEdge[] = [
-  { from: "intent_detector", to: "billing", status: "idle" },
-  { from: "intent_detector", to: "complaint", status: "idle" },
-  { from: "intent_detector", to: "sales", status: "idle" },
-  { from: "complaint", to: "tools", status: "idle" },
-  { from: "tools", to: "hitl", status: "idle" },
-  { from: "hitl", to: "ticket_service", status: "idle" },
+  { id: "route-billing", from: "intent_detector", to: "billing", status: "idle", kind: "route" },
+  { id: "route-complaint", from: "intent_detector", to: "complaint", status: "idle", kind: "route" },
+  { id: "route-sales", from: "intent_detector", to: "sales", status: "idle", kind: "route" },
+  { id: "data-billing-db", from: "billing", to: "billing_db", status: "idle", kind: "data" },
+  { id: "data-sales-mcp", from: "sales", to: "sales_mcp", status: "idle", kind: "data" },
+  { id: "data-mcp-neo4j", from: "sales_mcp", to: "product_db", status: "idle", kind: "data" },
+  { id: "data-complaint-api", from: "complaint", to: "ticket_api", status: "idle", kind: "data" },
+  { id: "data-api-db", from: "ticket_api", to: "ticket_db", status: "idle", kind: "data" },
+  { id: "pipe-complaint-hitl", from: "complaint", to: "hitl", status: "idle", kind: "pipeline" },
+  { id: "pipe-hitl-api", from: "hitl", to: "ticket_api", status: "idle", kind: "pipeline" },
+  { id: "collab-b-c", from: "billing", to: "complaint", status: "idle", kind: "collaboration" },
+  { id: "collab-c-s", from: "complaint", to: "sales", status: "idle", kind: "collaboration" },
+  { id: "collab-s-b", from: "sales", to: "billing", status: "idle", kind: "collaboration" },
 ]
+
+function createIdleNode(): GraphNodeState {
+  return { status: "idle", runningTools: [], completedTools: [] }
+}
 
 function createIdleNodes(): AgentGraphState["nodes"] {
   return {
-    intent_detector: { status: "idle" },
-    billing: { status: "idle" },
-    complaint: { status: "idle" },
-    sales: { status: "idle" },
-    tools: { status: "idle" },
-    hitl: { status: "idle" },
-    ticket_service: { status: "idle" },
+    intent_detector: createIdleNode(),
+    billing: createIdleNode(),
+    complaint: createIdleNode(),
+    sales: createIdleNode(),
+    hitl: createIdleNode(),
+    billing_db: createIdleNode(),
+    sales_mcp: createIdleNode(),
+    product_db: createIdleNode(),
+    ticket_api: createIdleNode(),
+    ticket_db: createIdleNode(),
   }
 }
 
@@ -95,9 +164,12 @@ export function createInitialAgentGraphState(): AgentGraphState {
   return {
     nodes: createIdleNodes(),
     edges: BASE_EDGES.map((edge) => ({ ...edge })),
+    handoffs: [],
     activities: [],
     routedAgent: null,
     showComplaintFlow: false,
+    traceConnected: false,
+    lastEventAt: null,
   }
 }
 
@@ -105,34 +177,50 @@ function createActivityId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-function pushActivity(
-  state: AgentGraphState,
-  message: string
-): AgentGraphState {
+export function pushActivity(state: AgentGraphState, message: string): AgentGraphState {
   const activities = [
     { id: createActivityId(), message, timestamp: Date.now() },
     ...state.activities,
-  ].slice(0, 8)
-
+  ].slice(0, 12)
   return { ...state, activities }
 }
 
-function setNode(
+export function setNode(
   state: AgentGraphState,
   nodeId: AgentNodeId,
   status: NodeStatus,
-  detail?: string
+  detail?: string,
+  toolState?: Pick<GraphNodeState, "runningTools" | "completedTools">
 ): AgentGraphState {
+  const current = state.nodes[nodeId]
   return {
     ...state,
     nodes: {
       ...state.nodes,
-      [nodeId]: { status, detail },
+      [nodeId]: {
+        status,
+        detail,
+        runningTools: toolState?.runningTools ?? current.runningTools,
+        completedTools: toolState?.completedTools ?? current.completedTools,
+      },
     },
   }
 }
 
-function setEdge(
+export function setEdgeById(
+  state: AgentGraphState,
+  edgeId: string,
+  status: EdgeStatus
+): AgentGraphState {
+  return {
+    ...state,
+    edges: state.edges.map((edge) =>
+      edge.id === edgeId ? { ...edge, status } : edge
+    ),
+  }
+}
+
+export function setEdge(
   state: AgentGraphState,
   from: AgentNodeId,
   to: AgentNodeId,
@@ -146,9 +234,16 @@ function setEdge(
   }
 }
 
+export function getEdgeStatus(
+  state: AgentGraphState,
+  from: AgentNodeId,
+  to: AgentNodeId
+): EdgeStatus {
+  return state.edges.find((edge) => edge.from === from && edge.to === to)?.status ?? "idle"
+}
+
 export function mapAgentValue(agent: string | null | undefined): AgentNodeId | null {
   if (!agent) return null
-
   const normalized = agent.toLowerCase()
   if (normalized.includes("billing")) return "billing"
   if (normalized.includes("complaint")) return "complaint"
@@ -157,161 +252,15 @@ export function mapAgentValue(agent: string | null | undefined): AgentNodeId | n
   return null
 }
 
-export function reduceAgentGraphOnStreamStart(
-  state: AgentGraphState
-): AgentGraphState {
-  const next = createInitialAgentGraphState()
-  return pushActivity(
-    setNode(
-      setEdge(next, "intent_detector", "billing", "idle"),
-      "intent_detector",
-      "active",
-      "Detecting intent..."
-    ),
-    "Message received — analyzing intent"
-  )
-}
-
-export function reduceAgentGraphOnIntent(
-  state: AgentGraphState,
-  intent: string,
-  agent: string
-): AgentGraphState {
-  const routed = mapAgentValue(agent)
-  let next = pushActivity(
-    setNode(state, "intent_detector", "completed", `Intent: ${intent}`),
-    `Intent detected: ${intent}`
-  )
-
-  if (!routed) return next
-
-  next = {
-    ...next,
-    routedAgent: routed,
-    showComplaintFlow: routed === "complaint",
-  }
-
-  next = setNode(next, routed, "active", "Handling request...")
-  next = setEdge(next, "intent_detector", routed, "active")
-
-  return pushActivity(next, `Routing to ${AGENT_NODES[routed].label}`)
-}
-
-export function reduceAgentGraphOnToolCall(
-  state: AgentGraphState,
-  toolName: string
-): AgentGraphState {
-  if (state.routedAgent !== "complaint") {
-    const agent = state.routedAgent
-    if (!agent) return state
-
-    return pushActivity(
-      setNode(state, agent, "active", `Running ${toolName}`),
-      `${AGENT_NODES[agent].label} calling ${toolName}`
-    )
-  }
-
-  let next = setNode(state, "complaint", "active", "Running tools...")
-  next = setNode(next, "tools", "active", toolName)
-  next = setEdge(next, "complaint", "tools", "active")
-
-  return pushActivity(next, `Complaint agent calling ${toolName}`)
-}
-
-export function reduceAgentGraphOnHitlRequest(
-  state: AgentGraphState
-): AgentGraphState {
-  let next = setNode(state, "tools", "completed", "Ticket staged")
-  next = setNode(next, "hitl", "waiting", "Awaiting approval")
-  next = setEdge(next, "tools", "hitl", "active")
-
-  return pushActivity(next, "Waiting for human approval")
-}
-
-export function reduceAgentGraphOnHitlResponse(
-  state: AgentGraphState,
-  response: "yes" | "no"
-): AgentGraphState {
-  let next = setNode(state, "hitl", "completed", response === "yes" ? "Approved" : "Declined")
-  next = setEdge(next, "tools", "hitl", "completed")
-
-  if (response === "yes") {
-    next = setNode(next, "ticket_service", "active", "Creating ticket...")
-    next = setEdge(next, "hitl", "ticket_service", "active")
-    return pushActivity(next, "Human approved — creating ticket")
-  }
-
-  next = setNode(next, "complaint", "active", "Finalizing response...")
-  return pushActivity(next, "Human declined — skipping ticket creation")
-}
-
-export function reduceAgentGraphOnToken(
-  state: AgentGraphState
-): AgentGraphState {
-  const agent = state.routedAgent
-  if (!agent) return state
-
-  if (state.nodes.ticket_service.status === "active") {
-    return setNode(state, "ticket_service", "active", "Writing ticket record...")
-  }
-
-  if (state.nodes[agent].status === "waiting") return state
-
-  return setNode(state, agent, "active", "Generating response...")
-}
-
-export function reduceAgentGraphOnDone(
-  state: AgentGraphState
-): AgentGraphState {
-  let next = state
-
-  if (next.nodes.ticket_service.status === "active") {
-    next = setNode(next, "ticket_service", "completed", "Ticket saved")
-    next = setEdge(next, "hitl", "ticket_service", "completed")
-  }
-
-  if (next.routedAgent) {
-    next = setNode(next, next.routedAgent, "completed", "Done")
-    next = setEdge(next, "intent_detector", next.routedAgent, "completed")
-
-    if (next.routedAgent === "complaint") {
-      if (next.nodes.tools.status !== "idle") {
-        next = setNode(next, "tools", "completed")
-        next = setEdge(next, "complaint", "tools", "completed")
-      }
-      if (next.nodes.hitl.status === "waiting") {
-        next = setNode(next, "hitl", "completed")
-      }
-    }
-  }
-
-  return pushActivity(next, "Request completed")
-}
-
-export function reduceAgentGraphOnError(
-  state: AgentGraphState,
-  message: string
-): AgentGraphState {
-  const activeNode =
-    (Object.entries(state.nodes).find(
-      ([, node]) => node.status === "active" || node.status === "waiting"
-    )?.[0] as AgentNodeId | undefined) ??
-    state.routedAgent ??
-    "intent_detector"
-
-  return pushActivity(
-    setNode(state, activeNode, "error", "Failed"),
-    message
-  )
-}
-
-export function getEdgeStatus(
-  state: AgentGraphState,
-  from: AgentNodeId,
-  to: AgentNodeId
-): EdgeStatus {
-  return (
-    state.edges.find((edge) => edge.from === from && edge.to === to)?.status ??
-    "idle"
-  )
-}
+export const AGENT_NODE_IDS: AgentNodeId[] = [
+  "intent_detector",
+  "billing",
+  "complaint",
+  "sales",
+  "hitl",
+  "billing_db",
+  "sales_mcp",
+  "product_db",
+  "ticket_api",
+  "ticket_db",
+]

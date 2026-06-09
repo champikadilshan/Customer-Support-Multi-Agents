@@ -94,7 +94,13 @@ function TicketsSkeleton() {
   )
 }
 
-export function TicketsPanel({ embedded = false }: { embedded?: boolean }) {
+export function TicketsPanel({
+  embedded = false,
+  hideHeader = false,
+}: {
+  embedded?: boolean
+  hideHeader?: boolean
+}) {
   const { tickets, isLoading, error, refresh } = useTickets()
   const [isRefreshing, setIsRefreshing] = useState(false)
 
@@ -106,29 +112,31 @@ export function TicketsPanel({ embedded = false }: { embedded?: boolean }) {
 
   const content = (
     <>
-      <div className="flex items-start justify-between gap-3 pb-4">
-        <div>
-          <h2 className="text-lg font-semibold tracking-tight">
-            Support Tickets
-          </h2>
-          <p className="mt-1 text-sm font-light text-muted-foreground">
-            Tickets created through customer support
-          </p>
+      {!hideHeader ? (
+        <div className="flex items-start justify-between gap-3 pb-4">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight">
+              Support Tickets
+            </h2>
+            <p className="mt-1 text-sm font-light text-muted-foreground">
+              Tickets created through customer support
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 shrink-0"
+            aria-label="Refresh tickets"
+            onClick={() => void handleRefresh()}
+            disabled={isRefreshing}
+          >
+            <RefreshCw
+              className={cn("h-4 w-4", isRefreshing && "animate-spin")}
+            />
+          </Button>
         </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8 shrink-0"
-          aria-label="Refresh tickets"
-          onClick={() => void handleRefresh()}
-          disabled={isRefreshing}
-        >
-          <RefreshCw
-            className={cn("h-4 w-4", isRefreshing && "animate-spin")}
-          />
-        </Button>
-      </div>
+      ) : null}
 
       <div className="scrollbar-hidden flex-1 overflow-y-auto">
         {isLoading ? <TicketsSkeleton /> : null}
