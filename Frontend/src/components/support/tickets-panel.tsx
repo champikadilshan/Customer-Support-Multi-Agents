@@ -94,7 +94,7 @@ function TicketsSkeleton() {
   )
 }
 
-export function TicketsPanel() {
+export function TicketsPanel({ embedded = false }: { embedded?: boolean }) {
   const { tickets, isLoading, error, refresh } = useTickets()
   const [isRefreshing, setIsRefreshing] = useState(false)
 
@@ -104,8 +104,8 @@ export function TicketsPanel() {
     setIsRefreshing(false)
   }
 
-  return (
-    <div className="sticky top-16 flex max-h-[calc(100vh-8rem-32px)] flex-col overflow-hidden">
+  const content = (
+    <>
       <div className="flex items-start justify-between gap-3 pb-4">
         <div>
           <h2 className="text-lg font-semibold tracking-tight">
@@ -165,6 +165,16 @@ export function TicketsPanel() {
           </div>
         ) : null}
       </div>
+    </>
+  )
+
+  if (embedded) {
+    return <div className="flex h-full flex-col overflow-hidden">{content}</div>
+  }
+
+  return (
+    <div className="sticky top-16 flex max-h-[calc(100vh-8rem-32px)] flex-col overflow-hidden">
+      {content}
     </div>
   )
 }

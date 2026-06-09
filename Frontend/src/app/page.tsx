@@ -6,8 +6,7 @@ import {
 } from "@/components/layout/page-header"
 import { SiteFooter } from "@/components/layout/site-footer"
 import { SiteHeader } from "@/components/layout/site-header"
-import { SupportChat } from "@/components/support/support-chat"
-import { TicketsPanel } from "@/components/support/tickets-panel"
+import { SupportWorkspace } from "@/components/support/support-workspace"
 import { Button } from "@/components/ui/button"
 
 export default function Home() {
@@ -15,9 +14,9 @@ export default function Home() {
     <>
       <SiteHeader />
       <main className="flex-1">
-        <div className="container grid grid-cols-1 gap-8 pt-1 md:grid-cols-2">
-          <div className="flex flex-col">
-            <PageHeader className="pb-4 pt-0 md:pb-6 md:pt-0">
+        <SupportWorkspace
+          header={
+            <PageHeader className="pb-4 pt-1 md:pb-6 md:pt-1">
               <PageHeaderHeading>
                 Customer support that feels human, powered by AI.
               </PageHeaderHeading>
@@ -32,16 +31,8 @@ export default function Home() {
                 </Button>
               </PageActions>
             </PageHeader>
-
-            <section className="px-4 pb-0">
-              <SupportChat />
-            </section>
-          </div>
-
-          <aside aria-label="Tickets panel" className="mt-12 hidden px-4 md:block">
-            <TicketsPanel />
-          </aside>
-        </div>
+          }
+        />
       </main>
       <SiteFooter />
     </>
