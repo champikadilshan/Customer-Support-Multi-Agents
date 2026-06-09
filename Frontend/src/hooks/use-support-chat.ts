@@ -23,7 +23,7 @@ const INITIAL_MESSAGES: Message[] = [
   {
     id: "demo-1",
     role: "user",
-    content: "Do you need any help?",
+    content: "Greetings! Let's start chatting",
   },
   {
     id: "demo-2",
