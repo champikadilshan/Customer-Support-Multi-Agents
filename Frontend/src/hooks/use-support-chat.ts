@@ -4,6 +4,17 @@ import { useCallback, useMemo, useRef, useState } from "react"
 
 import { type Message } from "@/components/ui/chat-message"
 import { refreshTicketsPanel } from "@/hooks/use-tickets"
+import {
+  createInitialAgentGraphState,
+  reduceAgentGraphOnDone,
+  reduceAgentGraphOnError,
+  reduceAgentGraphOnHitlRequest,
+  reduceAgentGraphOnHitlResponse,
+  reduceAgentGraphOnIntent,
+  reduceAgentGraphOnStreamStart,
+  reduceAgentGraphOnToken,
+  reduceAgentGraphOnToolCall,
+} from "@/lib/agent-graph"
 import { consumeSseStream, type SseEvent } from "@/lib/sse"
 
 export type { HitlRequest } from "@/lib/hitl"
@@ -38,6 +49,7 @@ export function useSupportChat() {
   const [isGenerating, setIsGenerating] = useState(false)
   const [activeAgent, setActiveAgent] = useState<string | null>(null)
   const [activeIntent, setActiveIntent] = useState<string | null>(null)
+  const [agentGraph, setAgentGraph] = useState(createInitialAgentGraphState)
   const abortRef = useRef<AbortController | null>(null)
   const assistantIdRef = useRef<string | null>(null)
 
@@ -45,6 +57,8 @@ export function useSupportChat() {
     () => messages.some((message) => message.hitlRequest && !message.hitlResponse),
     [messages]
   )
+
+  const isGraphLive = isGenerating || isHitlPending
 
   const handleInputChange = useCallback(
     (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -76,9 +90,19 @@ export function useSupportChat() {
         case "intent":
           setActiveIntent(event.data.intent)
           setActiveAgent(event.data.agent)
+          setAgentGraph((current) =>
+            reduceAgentGraphOnIntent(
+              current,
+              event.data.intent,
+              event.data.agent
+            )
+          )
           break
 
         case "tool_call":
+          setAgentGraph((current) =>
+            reduceAgentGraphOnToolCall(current, event.data.tool)
+          )
           updateAssistantMessage(assistantId, (message) => {
             const existing = message.toolInvocations ?? []
             const completed = existing.map((tool) =>
@@ -102,6 +126,7 @@ export function useSupportChat() {
           break
 
         case "token":
+          setAgentGraph((current) => reduceAgentGraphOnToken(current))
           updateAssistantMessage(assistantId, (message) => ({
             ...message,
             content: message.content + event.data.text,
@@ -109,6 +134,7 @@ export function useSupportChat() {
           break
 
         case "hitl_request":
+          setAgentGraph((current) => reduceAgentGraphOnHitlRequest(current))
           updateAssistantMessage(assistantId, (message) => ({
             ...message,
             hitlRequest: event.data,
@@ -116,6 +142,9 @@ export function useSupportChat() {
           break
 
         case "error":
+          setAgentGraph((current) =>
+            reduceAgentGraphOnError(current, event.data.message)
+          )
           updateAssistantMessage(assistantId, (message) => ({
             ...message,
             content: message.content || event.data.message,
@@ -123,6 +152,7 @@ export function useSupportChat() {
           break
 
         case "done":
+          setAgentGraph((current) => reduceAgentGraphOnDone(current))
           updateAssistantMessage(assistantId, (message) => {
             const completedTools = message.toolInvocations?.map((tool) =>
               tool.state === "call"
@@ -168,6 +198,7 @@ export function useSupportChat() {
       setMessages((current) => [...current, userMessage, assistantMessage])
       setActiveAgent(null)
       setActiveIntent(null)
+      setAgentGraph(reduceAgentGraphOnStreamStart)
       setIsGenerating(true)
 
       const controller = new AbortController()
@@ -182,6 +213,12 @@ export function useSupportChat() {
         )
       } catch (error) {
         if ((error as Error).name !== "AbortError") {
+          setAgentGraph((current) =>
+            reduceAgentGraphOnError(
+              current,
+              "Something went wrong while contacting support."
+            )
+          )
           updateAssistantMessage(assistantId, (current) => ({
             ...current,
             content:
@@ -238,6 +275,9 @@ export function useSupportChat() {
             : message
         )
       )
+      setAgentGraph((current) =>
+        reduceAgentGraphOnHitlResponse(current, response)
+      )
       setIsGenerating(true)
 
       const controller = new AbortController()
@@ -252,6 +292,12 @@ export function useSupportChat() {
         )
       } catch (error) {
         if ((error as Error).name !== "AbortError") {
+          setAgentGraph((current) =>
+            reduceAgentGraphOnError(
+              current,
+              "Failed to resume the complaint flow."
+            )
+          )
           updateAssistantMessage(messageId, (current) => ({
             ...current,
             content:
@@ -280,5 +326,7 @@ export function useSupportChat() {
     activeIntent,
     respondToHitl,
     suggestions: SUPPORT_SUGGESTIONS,
+    agentGraph,
+    isGraphLive,
   }
 }
