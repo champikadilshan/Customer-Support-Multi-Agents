@@ -119,7 +119,7 @@ def get_active_promotions(product_id: str = "") -> list[dict]:
         rows = run_query(cypher, params)
 
         if not rows:
-            return []   # no promotions is valid — empty list not an error
+            return [{"info": "No active promotions found.", "applicable_to": []}]
 
         return [
             {**row["promo"], "applicable_to": row["applicable_to"]}

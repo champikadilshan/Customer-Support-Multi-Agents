@@ -37,6 +37,7 @@ from datetime import datetime
 from typing import Optional
 
 from shared.a2a_protocol import AgentType
+from shared.trace_emitter import trace_emitter
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -115,12 +116,16 @@ class InMemorySessionStore:
             sess.messages     = []
             sess.active_agent = None
             sess.last_active  = datetime.utcnow()
+            trace_emitter.clear(session_id)
             return True
 
     def delete(self, session_id: str) -> bool:
         """Remove the session entirely. Returns True if it existed."""
         with self._lock:
-            return self._sessions.pop(session_id, None) is not None
+            existed = self._sessions.pop(session_id, None) is not None
+        if existed:
+            trace_emitter.clear(session_id)
+        return existed
 
     # ── Message helpers ───────────────────────────────────────────────────────
 

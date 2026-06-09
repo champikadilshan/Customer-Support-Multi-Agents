@@ -15,11 +15,13 @@ class A2ARequest(BaseModel):
     source_agent:         AgentType
     target_agent:         AgentType
     user_message:         str
-    context:              dict                = {}
-    # Serialised LangChain messages from the session store.
-    # Each entry is {"type": "human"|"ai"|"tool", "content": "...", "name": "..." (tool only)}
-    # Agents prepend these to their LangGraph state so the LLM has full context.
-    conversation_history: list[dict]          = []
+    context:              dict       = {}
+    # Serialised LangChain messages — agents prepend these to LangGraph state.
+    conversation_history: list[dict] = []
+    # Internal call flags — set by make_agent_call_tool, never by the orchestrator.
+    # is_internal=True suppresses greetings, HITL, and further inter-agent calls.
+    is_internal:          bool                  = False
+    calling_agent:        Optional[str]         = None   # AgentType.value string
 
 
 class A2AResponse(BaseModel):
@@ -28,6 +30,5 @@ class A2AResponse(BaseModel):
     status:       str           # "success" | "error" | "hitl_pending"
     result:       str
     metadata:     dict          = {}
-    # New messages produced by this agent turn (AI reply + tool messages).
-    # The orchestrator writes these back to the session store.
+    # New messages produced this turn — orchestrator writes back to session store.
     new_messages: list[dict]    = []

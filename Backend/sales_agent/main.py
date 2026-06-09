@@ -1,18 +1,5 @@
 """
-sales_agent/main.py
--------------------
-Sales agent — updated for multi-turn conversation sessions.
-
-Key changes vs original
-------------------------
-1. A2ARequest.conversation_history seeds the LangGraph state so the LLM
-   has full context across turns (e.g. "what about the cheaper one?" resolves
-   correctly against what was already discussed).
-
-2. System prompt updated with natural-conversation behavioural instructions.
-
-3. A2AResponse.new_messages carries messages produced this turn back to the
-   orchestrator for session storage.
+sales_agent/main.py  (v3 — multi-agent collaboration + trace)
 """
 
 import json
@@ -35,9 +22,10 @@ from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import SALES_AGENT_PORT, AGENT_HOST, SALES_MCP_PORT
 from shared.llm import get_vertex_llm
 from shared.message_utils import dicts_to_messages, messages_to_dicts
+from shared.agent_call_tool import make_agent_call_tool, bind_inter_agent_args
+from shared.trace_emitter import trace_emitter
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-
 
 # ── MCP client ────────────────────────────────────────────────────────────────
 
@@ -48,15 +36,17 @@ mcp_client = MultiServerMCPClient({
     }
 })
 
-
 # ── LangGraph state ───────────────────────────────────────────────────────────
 
 class SalesState(TypedDict):
     request_id:     str
     user_message:   str
+    session_id:     str
+    is_internal:    bool
+    calling_agent:  str
+    history:        list[dict]
     messages:       Annotated[list[BaseMessage], operator.add]
     final_response: str
-
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -66,38 +56,154 @@ llm = get_vertex_llm(temperature=0)
 sales_graph: CompiledStateGraph = None
 mcp_tools:   list               = []
 
+# ── Inter-agent tools (unbound) ───────────────────────────────────────────────
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+_call_complaint_agent_tool = make_agent_call_tool(
+    target=AgentType.COMPLAINT,
+    description=(
+        "Call the complaint agent to check the status of an existing ticket or retrieve "
+        "a customer's complaint history. Use this when the customer asks about an open issue "
+        "or ticket during a sales conversation. Pass the customer_id or ticket_id in the task."
+    ),
+)
 
-SYSTEM_PROMPT = """You are a friendly, knowledgeable, and enthusiastic sales agent for a telecommunications company.
+_call_billing_agent_tool = make_agent_call_tool(
+    target=AgentType.BILLING,
+    description=(
+        "Call the billing agent to check a customer's current balance, invoice history, "
+        "or payment methods. Use this when the customer wants to understand their current "
+        "charges before committing to a new plan, or when a credit needs to be confirmed. "
+        "Pass the account_id in the task."
+    ),
+)
 
-CONVERSATION BEHAVIOUR — follow these rules exactly:
-1. Greet the user warmly on the very first message. On subsequent turns, continue
-   naturally without re-introducing yourself.
-2. Use the available tools to fetch real product data and promotions before
-   making any recommendations — never guess prices or availability.
+# ── System prompts ────────────────────────────────────────────────────────────
+
+USER_FACING_PROMPT = """You are a friendly, knowledgeable, and enthusiastic sales agent for a telecommunications company.
+
+CONVERSATION BEHAVIOUR:
+1. Greet the user warmly on the first message. Continue naturally on subsequent turns.
+2. Use tools to fetch real product data and promotions before making recommendations.
 3. Always mention relevant active promotions when recommending products.
-4. Use the conversation history to resolve follow-up references such as
-   "what about the cheaper one?" or "can I add a mobile plan to that?" without
-   asking the customer to repeat themselves.
-5. If the customer seems interested in a product, guide them towards a decision
-   by highlighting the key benefit and any active deal — but never be pushy.
-6. If the customer is ready to purchase or asks how to sign up, let them know
-   you can connect them to the support team to arrange activation.
-7. Never expose raw tool output or JSON to the customer — translate everything
-   into warm, conversational language.
-8. Keep responses concise; use bullet points only when comparing multiple products.
-9. If the customer says goodbye or thanks you, close the conversation warmly."""
+4. Use conversation history to resolve follow-up references ("the cheaper one", "add mobile to that")
+   without asking the customer to repeat themselves.
+5. If the customer seems interested, highlight the key benefit and any active deal — never be pushy.
+6. If the customer is ready to purchase, let them know you can connect them to the activation team.
+7. Never expose raw tool output or JSON — translate everything into warm, conversational language.
+8. Close warmly if the customer says goodbye.
+
+COLLABORATION — STRICT RULES:
+- If the customer's message mentions a ticket number, ticket status, complaint, or customer ID
+  alongside a product question, you MUST call call_complaint_agent in the SAME turn.
+  Do this BEFORE or AFTER fetching products — but do it in the same response.
+  Example: "show me plans and check ticket 1" → call get_product_catalog AND call_complaint_agent.
+- If the customer mentions their current bill or charges before committing to a plan,
+  call call_billing_agent with their account_id.
+- Weave all results into one seamless response — never tell the customer you called another agent.
+- Only skip inter-agent calls if the customer's message is purely about products."""
+
+import re as _re
+
+# Keywords that reliably signal a ticket status check is needed
+_TICKET_PATTERNS = _re.compile(
+    r"ticket\s*(number|#|no\.?)?\s*\d+|check\s*(my\s*)?(ticket|complaint)|"
+    r"status\s*of\s*(my\s*)?(ticket|complaint)|complaint\s*(history|status)",
+    _re.IGNORECASE,
+)
+_CUSTOMER_ID_PATTERN = _re.compile(
+    r"customer\s*(id\s*)?[:\s]*(CUST-\d+)", _re.IGNORECASE
+)
+_TICKET_ID_PATTERN = _re.compile(
+    r"ticket\s*(number|#|no\.?)?\s*(\d+)", _re.IGNORECASE
+)
 
 
-# ── Graph builder ─────────────────────────────────────────────────────────────
+def _needs_complaint_check(message: str) -> tuple[bool, str]:
+    """
+    Return (True, task_description) if the message contains a ticket/complaint
+    check request alongside a product question.
+    """
+    match = _TICKET_PATTERNS.search(message)
+    print(f"[TICKET_PATTERN] input={repr(message[:100])}")
+    print(f"[TICKET_PATTERN] match={match}")
+    if not match:
+        return False, ""
 
-def build_sales_graph(tools: list) -> CompiledStateGraph:
-    llm_with_tools = llm.bind_tools(tools)
+    cust_match   = _CUSTOMER_ID_PATTERN.search(message)
+    ticket_match = _TICKET_ID_PATTERN.search(message)
+    print(f"[TICKET_PATTERN] cust_match={cust_match}, ticket_match={ticket_match}")
+
+    customer_id = cust_match.group(2)   if cust_match   else "CUST-001"
+    ticket_id   = ticket_match.group(2) if ticket_match else None
+
+    if ticket_id:
+        task = f"Check the status of ticket #{ticket_id} for customer {customer_id}."
+    else:
+        task = f"Retrieve complaint history for customer {customer_id}."
+
+    return True, task
+
+def build_sales_graph(mcp_tool_list: list) -> CompiledStateGraph:
 
     def agent_node(state: SalesState) -> SalesState:
+        is_internal   = state.get("is_internal", False)
+        session_id    = state.get("session_id", "")
+        history       = state.get("history", [])
+        system_prompt = INTERNAL_PROMPT if is_internal else USER_FACING_PROMPT
+
+        if is_internal:
+            all_tools = mcp_tool_list
+        else:
+            bound_complaint = bind_inter_agent_args(
+                _call_complaint_agent_tool,
+                session_id=session_id,
+                calling_agent=AgentType.SALES.value,
+                history=history,
+            )
+            bound_billing = bind_inter_agent_args(
+                _call_billing_agent_tool,
+                session_id=session_id,
+                calling_agent=AgentType.SALES.value,
+                history=history,
+            )
+            all_tools = [*mcp_tool_list, bound_complaint, bound_billing]
+
+        # ── Pre-flight: deterministic inter-agent call detection ──────────────
+        extra_messages = []
+        if not is_internal:
+            # Use the last HumanMessage from the messages list — state["user_message"]
+            # is the original first-turn value and never updates across turns.
+            from langchain_core.messages import HumanMessage as _HM
+            last_human = ""
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, _HM) and msg.content:
+                    last_human = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    break
+            print(f"[SALES PRE-FLIGHT] last_human={repr(last_human[:80])}")
+            needs_check, task = _needs_complaint_check(last_human)
+            print(f"[SALES PRE-FLIGHT] needs_check={needs_check}, task={repr(task)}")
+            if needs_check:
+                print(f"[SALES PRE-FLIGHT] Calling complaint agent: {task}")
+                from shared.trace_emitter import trace_emitter as _te
+                _te.emit(session_id, "agent_handoff",
+                         from_agent="sales", to_agent="complaint",
+                         reason=task)
+                complaint_result = bound_complaint.invoke({"task": task})
+                print(f"[SALES PRE-FLIGHT] Result: {repr(str(complaint_result)[:120])}")
+                extra_messages = [
+                    {
+                        "role":    "system",
+                        "content": f"[Complaint agent result for this turn]: {complaint_result}"
+                    }
+                ]
+                # Remove call_complaint_agent from tools so LLM doesn't call it again
+                all_tools = [t for t in all_tools
+                             if getattr(t, "name", "") != "call_complaint_agent"]
+
+        llm_with_tools = llm.bind_tools(all_tools)
         messages_with_system = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
+            *extra_messages,
             *state["messages"],
         ]
         response = llm_with_tools.invoke(messages_with_system)
@@ -112,18 +218,16 @@ def build_sales_graph(tools: list) -> CompiledStateGraph:
             final = "I was unable to retrieve product information at this time. Please try again."
         return {**state, "final_response": final}
 
+    all_possible_tools = [*mcp_tool_list, _call_complaint_agent_tool, _call_billing_agent_tool]
+
     graph = StateGraph(SalesState)
     graph.add_node("agent",           agent_node)
-    graph.add_node("tools",           ToolNode(tools))
+    graph.add_node("tools",           ToolNode(all_possible_tools))
     graph.add_node("format_response", format_response_node)
 
     graph.set_entry_point("agent")
-
-    graph.add_conditional_edges(
-        "agent",
-        tools_condition,
-        {"tools": "tools", END: "format_response"},
-    )
+    graph.add_conditional_edges("agent", tools_condition,
+                                {"tools": "tools", END: "format_response"})
     graph.add_edge("tools",           "agent")
     graph.add_edge("format_response", END)
 
@@ -140,20 +244,22 @@ def _extract_text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
-            b.get("text", "") for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
+        return "".join(b.get("text", "") for b in content
+                       if isinstance(b, dict) and b.get("type") == "text")
     return ""
 
 
 # ── Streaming generator ───────────────────────────────────────────────────────
 
 async def stream_sales_graph(
-    req:   A2ARequest,
-    graph: CompiledStateGraph,
+    req: A2ARequest, graph: CompiledStateGraph,
 ) -> AsyncIterator[str]:
-    # Reconstruct full message history
+    session_id = req.context.get("session_id", req.request_id)
+
+    trace_emitter.emit(session_id, "agent_start", agent="sales",
+                       is_internal=req.is_internal,
+                       triggered_by=req.calling_agent or "orchestrator")
+
     prior_messages = dicts_to_messages(req.conversation_history)
     if not prior_messages or not isinstance(prior_messages[-1], HumanMessage):
         prior_messages.append(HumanMessage(content=req.user_message))
@@ -161,6 +267,10 @@ async def stream_sales_graph(
     initial_state: SalesState = {
         "request_id":     req.request_id,
         "user_message":   req.user_message,
+        "session_id":     session_id,
+        "is_internal":    req.is_internal,
+        "calling_agent":  req.calling_agent or "",
+        "history":        req.conversation_history,
         "messages":       prior_messages,
         "final_response": "",
     }
@@ -171,14 +281,22 @@ async def stream_sales_graph(
             name = event.get("name", "")
 
             if kind == "on_tool_start":
-                yield _sse("tool_call", {"tool": event.get("name", "unknown_tool")})
+                tool_name = event.get("name", "unknown_tool")
+                trace_emitter.emit(session_id, "tool_start",
+                                   agent="sales", tool=tool_name)
+                if not req.is_internal:
+                    yield _sse("tool_call", {"tool": tool_name})
+
+            elif kind == "on_tool_end":
+                trace_emitter.emit(session_id, "tool_end",
+                                   agent="sales", tool=event.get("name", ""))
 
             elif kind == "on_chat_model_stream":
                 chunk = event["data"].get("chunk")
                 if chunk is None:
                     continue
                 text = _extract_text(chunk.content)
-                if text:
+                if text and not req.is_internal:
                     yield _sse("token", {"text": text})
 
             elif kind == "on_chain_stream" and name == "format_response":
@@ -186,17 +304,23 @@ async def stream_sales_graph(
                 if not isinstance(chunk, dict):
                     continue
                 text = chunk.get("final_response", "")
-                if isinstance(text, str) and text:
+                if isinstance(text, str) and text and not req.is_internal:
                     yield _sse("token", {"text": text})
 
-        yield _sse("done", {
-            "request_id": req.request_id,
-            "agent":      AgentType.SALES.value,
-            "status":     "success",
-        })
+        trace_emitter.emit(session_id, "agent_end", agent="sales",
+                           status="success", is_internal=req.is_internal)
+
+        if not req.is_internal:
+            yield _sse("done", {
+                "request_id": req.request_id,
+                "agent":      AgentType.SALES.value,
+                "status":     "success",
+            })
 
     except Exception as exc:
-        yield _sse("error", {"message": str(exc)})
+        trace_emitter.emit(session_id, "error", agent="sales", message=str(exc))
+        if not req.is_internal:
+            yield _sse("error", {"message": str(exc)})
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -204,45 +328,35 @@ async def stream_sales_graph(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global sales_graph, mcp_tools
-
     mcp_url = f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse"
     print(f"Connecting to Sales MCP server at {mcp_url} ...")
-
     try:
         mcp_tools = await mcp_client.get_tools()
     except Exception as e:
-        print(f"ERROR: Could not connect to Sales MCP server at {mcp_url}")
-        print(f"  Make sure mcp_server.py is running first.")
-        print(f"  Original error: {e}")
         raise RuntimeError(
-            f"Sales MCP server is not reachable at {mcp_url}. "
-            "Start it with: python sales_agent/mcp_server.py"
+            f"Sales MCP server not reachable at {mcp_url}. "
+            "Start with: python sales_agent/mcp_server.py"
         ) from e
 
-    tool_names = [t.name for t in mcp_tools]
-    print(f"Loaded {len(mcp_tools)} tools from MCP server: {tool_names}")
+    tool_names  = [t.name for t in mcp_tools]
+    print(f"Loaded {len(mcp_tools)} MCP tools: {tool_names}")
     sales_graph = build_sales_graph(mcp_tools)
     print("Sales agent graph built and ready.")
-
     yield
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Sales Agent", version="2.0", lifespan=lifespan)
+app = FastAPI(title="Sales Agent", version="3.0", lifespan=lifespan)
 
 
 @app.post("/process/stream")
 async def process_stream(req: A2ARequest) -> StreamingResponse:
     if sales_graph is None:
         async def not_ready():
-            yield _sse("error", {"message": "Sales agent is not ready yet. MCP tools are still loading."})
-        return StreamingResponse(
-            not_ready(),
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no"},
-        )
-
+            yield _sse("error", {"message": "Sales agent not ready yet."})
+        return StreamingResponse(not_ready(), media_type="text/event-stream",
+                                 headers={"X-Accel-Buffering": "no"})
     return StreamingResponse(
         stream_sales_graph(req, sales_graph),
         media_type="text/event-stream",
@@ -253,12 +367,14 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
     if sales_graph is None:
-        return A2AResponse(
-            request_id=req.request_id,
-            source_agent=AgentType.SALES,
-            status="error",
-            result="Sales agent is not ready yet. MCP tools are still loading.",
-        )
+        return A2AResponse(request_id=req.request_id, source_agent=AgentType.SALES,
+                           status="error", result="Sales agent not ready yet.")
+
+    session_id = req.context.get("session_id", req.request_id)
+
+    trace_emitter.emit(session_id, "agent_start", agent="sales",
+                       is_internal=req.is_internal,
+                       triggered_by=req.calling_agent or "orchestrator")
 
     prior_messages = dicts_to_messages(req.conversation_history)
     if not prior_messages or not isinstance(prior_messages[-1], HumanMessage):
@@ -267,24 +383,27 @@ async def process(req: A2ARequest) -> A2AResponse:
     initial_state: SalesState = {
         "request_id":     req.request_id,
         "user_message":   req.user_message,
+        "session_id":     session_id,
+        "is_internal":    req.is_internal,
+        "calling_agent":  req.calling_agent or "",
+        "history":        req.conversation_history,
         "messages":       prior_messages,
         "final_response": "",
     }
 
-    result = await sales_graph.ainvoke(initial_state)
-
+    result        = await sales_graph.ainvoke(initial_state)
     prior_len     = len(prior_messages)
     new_msgs_dict = messages_to_dicts(result["messages"][prior_len:])
+
+    trace_emitter.emit(session_id, "agent_end", agent="sales",
+                       status="success", is_internal=req.is_internal)
 
     return A2AResponse(
         request_id=req.request_id,
         source_agent=AgentType.SALES,
         status="success",
         result=result["final_response"],
-        metadata={
-            "tools_source": "mcp",
-            "mcp_url":      f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse",
-        },
+        metadata={"tools_source": "mcp", "mcp_url": f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse"},
         new_messages=new_msgs_dict,
     )
 
@@ -300,9 +419,5 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "sales_agent.main:app",
-        host="0.0.0.0",
-        port=SALES_AGENT_PORT,
-        reload=False,
-    )
+    uvicorn.run("sales_agent.main:app", host="0.0.0.0",
+                port=SALES_AGENT_PORT, reload=False)
