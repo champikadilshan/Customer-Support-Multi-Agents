@@ -20,8 +20,10 @@ interface ChatPropsBase {
   className?: string
   handleInputChange: React.ChangeEventHandler<HTMLTextAreaElement>
   isGenerating: boolean
+  isHitlPending?: boolean
   activeAgent?: string | null
   activeIntent?: string | null
+  respondToHitl?: (messageId: string, response: "yes" | "no") => void
   stop?: () => void
 }
 
@@ -44,8 +46,10 @@ export function Chat({
   handleInputChange,
   stop,
   isGenerating,
+  isHitlPending = false,
   activeAgent = null,
   activeIntent = null,
+  respondToHitl,
   append,
   suggestions,
   className,
@@ -75,9 +79,15 @@ export function Chat({
           activeIntent,
           hasActiveToolCall: Boolean(hasActiveToolCall),
         }),
+        isHitlResponding:
+          isGenerating && Boolean(message.hitlResponse && message.hitlRequest),
+        onHitlRespond:
+          message.hitlRequest && !message.hitlResponse && respondToHitl
+            ? (response: "yes" | "no") => respondToHitl(message.id, response)
+            : undefined,
       }
     },
-    [activeAgent, activeIntent, isGenerating, lastMessage?.id]
+    [activeAgent, activeIntent, isGenerating, lastMessage?.id, respondToHitl]
   )
 
   return (
@@ -91,7 +101,11 @@ export function Chat({
       ) : null}
 
       {messages.length > 0 ? (
-        <ChatMessages isGenerating={isGenerating} messages={messages}>
+        <ChatMessages
+          isGenerating={isGenerating}
+          isHitlPending={isHitlPending}
+          messages={messages}
+        >
           <MessageList
             messages={messages}
             showTimeStamps={false}
@@ -111,7 +125,7 @@ export function Chat({
           value={input}
           onChange={handleInputChange}
           stop={stop}
-          isGenerating={isGenerating}
+          isGenerating={isGenerating || isHitlPending}
         />
       </form>
     </ChatContainer>
@@ -122,9 +136,11 @@ export function ChatMessages({
   messages,
   children,
   isGenerating = false,
+  isHitlPending = false,
 }: React.PropsWithChildren<{
   messages: Message[]
   isGenerating?: boolean
+  isHitlPending?: boolean
 }>) {
   const {
     containerRef,
@@ -132,7 +148,7 @@ export function ChatMessages({
     handleScroll,
     shouldAutoScroll,
     handleTouchStart,
-  } = useAutoScroll([messages, isGenerating])
+  } = useAutoScroll([messages, isGenerating, isHitlPending])
 
   useEffect(() => {
     if (!isGenerating || !shouldAutoScroll) return

@@ -1,21 +1,12 @@
 "use client"
 
-import { useCallback, useRef, useState } from "react"
+import { useCallback, useMemo, useRef, useState } from "react"
 
 import { type Message } from "@/components/ui/chat-message"
 import { refreshTicketsPanel } from "@/hooks/use-tickets"
 import { consumeSseStream, type SseEvent } from "@/lib/sse"
 
-export type HitlRequest = {
-  request_id: string
-  question: string
-  ticket_preview: {
-    title?: string
-    category?: string
-    priority?: string
-  }
-  options: string[]
-}
+export type { HitlRequest } from "@/lib/hitl"
 
 const INITIAL_MESSAGES: Message[] = [
   {
@@ -47,9 +38,13 @@ export function useSupportChat() {
   const [isGenerating, setIsGenerating] = useState(false)
   const [activeAgent, setActiveAgent] = useState<string | null>(null)
   const [activeIntent, setActiveIntent] = useState<string | null>(null)
-  const [hitlRequest, setHitlRequest] = useState<HitlRequest | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const assistantIdRef = useRef<string | null>(null)
+
+  const isHitlPending = useMemo(
+    () => messages.some((message) => message.hitlRequest && !message.hitlResponse),
+    [messages]
+  )
 
   const handleInputChange = useCallback(
     (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -114,7 +109,10 @@ export function useSupportChat() {
           break
 
         case "hitl_request":
-          setHitlRequest(event.data)
+          updateAssistantMessage(assistantId, (message) => ({
+            ...message,
+            hitlRequest: event.data,
+          }))
           break
 
         case "error":
@@ -170,7 +168,6 @@ export function useSupportChat() {
       setMessages((current) => [...current, userMessage, assistantMessage])
       setActiveAgent(null)
       setActiveIntent(null)
-      setHitlRequest(null)
       setIsGenerating(true)
 
       const controller = new AbortController()
@@ -203,12 +200,12 @@ export function useSupportChat() {
   const sendMessage = useCallback(
     async (content: string) => {
       const trimmed = content.trim()
-      if (!trimmed || isGenerating) return
+      if (!trimmed || isGenerating || isHitlPending) return
 
       setInput("")
       await streamMessage(trimmed)
     },
-    [isGenerating, streamMessage]
+    [isGenerating, isHitlPending, streamMessage]
   )
 
   const handleSubmit = useCallback(
@@ -227,11 +224,20 @@ export function useSupportChat() {
   )
 
   const respondToHitl = useCallback(
-    async (response: "yes" | "no") => {
-      if (!hitlRequest) return
+    async (messageId: string, response: "yes" | "no") => {
+      const targetMessage = messages.find((message) => message.id === messageId)
+      if (!targetMessage?.hitlRequest || targetMessage.hitlResponse) return
 
-      const requestId = hitlRequest.request_id
-      setHitlRequest(null)
+      const requestId = targetMessage.hitlRequest.request_id
+      assistantIdRef.current = messageId
+
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === messageId
+            ? { ...message, hitlResponse: response }
+            : message
+        )
+      )
       setIsGenerating(true)
 
       const controller = new AbortController()
@@ -241,33 +247,24 @@ export function useSupportChat() {
         await consumeSseStream(
           "/api/chat/resume",
           { request_id: requestId, hitl_response: response },
-          (event) => {
-            const assistantId = assistantIdRef.current
-            if (assistantId) {
-              handleStreamEvent(assistantId, event)
-            }
-          },
+          (event) => handleStreamEvent(messageId, event),
           controller.signal
         )
       } catch (error) {
         if ((error as Error).name !== "AbortError") {
-          setMessages((current) => [
+          updateAssistantMessage(messageId, (current) => ({
             ...current,
-            {
-              id: createId(),
-              role: "assistant",
-              content:
-                "Failed to resume the complaint flow. Please try your request again.",
-              createdAt: new Date(),
-            },
-          ])
+            content:
+              current.content ||
+              "Failed to resume the complaint flow. Please try your request again.",
+          }))
         }
       } finally {
         abortRef.current = null
         setIsGenerating(false)
       }
     },
-    [handleStreamEvent, hitlRequest]
+    [handleStreamEvent, messages, updateAssistantMessage]
   )
 
   return {
@@ -278,9 +275,9 @@ export function useSupportChat() {
     append,
     stop,
     isGenerating,
+    isHitlPending,
     activeAgent,
     activeIntent,
-    hitlRequest,
     respondToHitl,
     suggestions: SUPPORT_SUGGESTIONS,
   }

@@ -5,9 +5,11 @@ import { cva, type VariantProps } from "class-variance-authority"
 import { Ban, Loader2, Terminal } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { type HitlRequest } from "@/lib/hitl"
 import { AgentActivityIndicator } from "@/components/ui/agent-activity-indicator"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { StreamingMarkdown } from "@/components/ui/streaming-markdown"
+import { HitlConfirmationCard } from "@/components/support/hitl-confirmation-card"
 
 const chatBubbleVariants = cva(
   "group/message relative break-words rounded-lg p-3 text-sm sm:max-w-[70%]",
@@ -73,6 +75,8 @@ export interface Message {
   content: string
   createdAt?: Date
   toolInvocations?: ToolInvocation[]
+  hitlRequest?: HitlRequest
+  hitlResponse?: "yes" | "no"
 }
 
 export interface ChatMessageProps extends Message {
@@ -82,6 +86,8 @@ export interface ChatMessageProps extends Message {
   isStreaming?: boolean
   enableTypewriter?: boolean
   statusMessage?: string
+  isHitlResponding?: boolean
+  onHitlRespond?: (response: "yes" | "no") => void
 }
 
 export const ChatMessage: React.FC<ChatMessageProps> = ({
@@ -92,9 +98,13 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
   animation = "scale",
   actions,
   toolInvocations,
+  hitlRequest,
+  hitlResponse,
   isStreaming = false,
   enableTypewriter = false,
   statusMessage = "Analyzing your request",
+  isHitlResponding = false,
+  onHitlRespond,
 }) => {
   const isUser = role === "user"
   const hasActiveToolCall = toolInvocations?.some(
@@ -161,20 +171,25 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
         <div className={cn(chatBubbleVariants({ isUser, animation }))}>
           {renderAssistantContent()}
         </div>
+        {renderHitlCard()}
       </div>
     )
   }
 
   return (
-    <div className="flex flex-col items-start">
-      <div className={cn(chatBubbleVariants({ isUser, animation }))}>
-        {renderAssistantContent()}
-        {actions && !isStreaming ? (
-          <div className="absolute -bottom-4 right-2 flex space-x-1 rounded-lg border bg-background p-1 text-foreground opacity-0 transition-opacity group-hover/message:opacity-100">
-            {actions}
-          </div>
-        ) : null}
-      </div>
+    <div className="flex flex-col items-start gap-2">
+      {(isStreaming || content) && (
+        <div className={cn(chatBubbleVariants({ isUser, animation }))}>
+          {renderAssistantContent()}
+          {actions && !isStreaming ? (
+            <div className="absolute -bottom-4 right-2 flex space-x-1 rounded-lg border bg-background p-1 text-foreground opacity-0 transition-opacity group-hover/message:opacity-100">
+              {actions}
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      {renderHitlCard()}
 
       {showTimeStamp && createdAt ? (
         <time
@@ -186,6 +201,20 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
       ) : null}
     </div>
   )
+
+  function renderHitlCard() {
+    if (!hitlRequest) return null
+
+    return (
+      <HitlConfirmationCard
+        request={hitlRequest}
+        response={hitlResponse}
+        isResponding={isHitlResponding}
+        disabled={!onHitlRespond || isHitlResponding}
+        onRespond={onHitlRespond ?? (() => undefined)}
+      />
+    )
+  }
 }
 
 function ToolCall({
