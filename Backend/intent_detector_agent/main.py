@@ -48,6 +48,7 @@ from shared.config import AGENT_URLS, INTENT_DETECTOR_PORT
 from shared.llm import get_vertex_llm
 from shared.session_store import session_store
 from shared.message_utils import messages_to_dicts, dicts_to_messages
+from shared.trace_emitter import trace_emitter
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -255,71 +256,169 @@ def build_orchestrator_graph() -> CompiledStateGraph:
 
 # ── Core session-aware chat logic ─────────────────────────────────────────────
 
+# Short confirmations and sentences starting with yes/no that should never
+# trigger an agent switch mid-conversation.
+_CONFIRMATION_STARTERS = {
+    "yes", "no", "ok", "okay", "sure", "yep", "nope", "yeah", "nah",
+    "confirm", "cancel", "please", "go ahead", "do it", "skip", "don't",
+    "dont",
+}
+
+# Keywords that indicate the sticky agent's primary domain is still active
+_SALES_KEYWORDS    = {"plan", "plans", "product", "fiber", "internet", "mobile",
+                      "tv", "bundle", "price", "pricing", "upgrade", "promotion",
+                      "deal", "offer", "buy", "purchase", "available"}
+_BILLING_KEYWORDS  = {"bill", "invoice", "charge", "payment", "balance", "pay",
+                      "owe", "statement", "account"}
+_COMPLAINT_KEYWORDS = {"ticket", "complaint", "issue", "problem", "outage",
+                       "refund", "broken", "not working", "check ticket",
+                       "check complaint", "ticket number", "ticket status"}
+
+_DOMAIN_KEYWORDS: dict[AgentType, set] = {
+    AgentType.SALES:     _SALES_KEYWORDS,
+    AgentType.BILLING:   _BILLING_KEYWORDS,
+    AgentType.COMPLAINT: _COMPLAINT_KEYWORDS,
+}
+
+
+def _is_mixed_intent(message: str, active_agent: AgentType) -> bool:
+    """
+    Return True when a message contains keywords from BOTH the active agent's
+    domain AND another domain. In this case the sticky agent should handle the
+    whole message — its pre-flight logic will make the inter-agent call for the
+    secondary domain.
+
+    Example: sticky=sales, message="show me plans and check ticket 1"
+      → sales keywords present (plans) + complaint keywords present (ticket)
+      → return True → keep sales, let sales pre-flight call complaint
+    """
+    words = set(message.lower().split())
+
+    primary_keywords   = _DOMAIN_KEYWORDS.get(active_agent, set())
+    has_primary        = bool(words & primary_keywords)
+
+    # Check if any OTHER domain's keywords are present
+    other_domains = [a for a in _DOMAIN_KEYWORDS if a != active_agent]
+    has_secondary  = any(bool(words & _DOMAIN_KEYWORDS[a]) for a in other_domains)
+
+    result = has_primary and has_secondary
+    print(f"[MIXED_INTENT] active={active_agent.value} has_primary={has_primary} "
+          f"has_secondary={has_secondary} result={result}")
+    return result
+
+
+def _is_confirmation(message: str) -> bool:
+    """
+    Return True if the message should keep the current sticky agent.
+    Matches:
+      - Short messages (≤4 words) that are purely confirmations
+      - Any message whose first word is a clear yes/no signal
+        (e.g. "yes please raise a complaint" → starts with "yes")
+    """
+    cleaned = message.lower().strip().rstrip(".,!?")
+    words   = cleaned.split()
+    if not words:
+        return False
+    # First word is a confirmation signal — keep sticky agent regardless of length
+    if words[0] in _CONFIRMATION_STARTERS:
+        return True
+    # Short messages that are entirely confirmation vocabulary
+    if len(words) <= 4 and set(words) & _CONFIRMATION_STARTERS:
+        return True
+    return False
+
+
 async def _run_chat(
     user_message: str,
     session_id:   Optional[str],
 ) -> tuple[dict, str]:
     """
     Shared logic for /chat (blocking) and the intent step of /chat/stream.
-
     Returns (result_dict, session_id).
-
-    result_dict keys:
-        intent, agent, request_id, response, new_messages
     """
     sess = session_store.get_or_create(session_id)
     sid  = sess.session_id
 
-    history     = session_store.get_messages(sid)
+    history      = session_store.get_messages(sid)
     active_agent = session_store.get_active_agent(sid)
 
-    # ── Determine intent / target agent ───────────────────────────────────────
-    # Always run intent detection (with history for context), but if a sticky
-    # agent is already set we only update it when the intent genuinely changes.
-    initial_state: OrchestratorState = {
-        "user_message":         user_message,
-        "conversation_history": history,
-        "detected_intent":      "",
-        "target_agent":         active_agent or AgentType.BILLING,
-        "a2a_response":         "",
-        "request_id":           "",
-        "final_response":       "",
-    }
+    # ── Pending handoff: billing told user "transferring to complaint team" ───
+    # When billing sets pending_handoff=complaint in session metadata, the next
+    # user message (even a bare "yes") must go to complaint regardless of intent.
+    pending_handoff = session_store.get_metadata(sid, "pending_handoff")
+    if pending_handoff and pending_handoff in AGENT_TYPE_MAP:
+        previous_agent = active_agent.value if active_agent else "unknown"
+        new_agent      = AGENT_TYPE_MAP[pending_handoff]
+        session_store.set_active_agent(sid, new_agent)
+        session_store.set_metadata(sid, "pending_handoff", None)
+        active_agent = new_agent
+        request_id   = str(uuid.uuid4())
+        intent       = pending_handoff
+        trace_emitter.emit(sid, "handoff_executed",
+                           from_agent=previous_agent,
+                           to_agent=pending_handoff,
+                           request_id=request_id,
+                           reason="pending_handoff consumed — routing forced to new agent")
+        session_store.append_messages(sid, [{"type": "human", "content": user_message}])
+        history = session_store.get_messages(sid)
+        return {"intent": intent, "agent": active_agent,
+                "request_id": request_id, "history": history}, sid
 
-    intent_state = detect_intent_node(initial_state)
-    intent       = intent_state["detected_intent"]
-    request_id   = intent_state["request_id"]
+    # ── Sticky routing: skip re-classification for short confirmations ─────────
+    if active_agent and _is_confirmation(user_message):
+        intent     = active_agent.value
+        request_id = str(uuid.uuid4())
 
-    if intent in VALID_INTENTS:
-        new_agent = AGENT_TYPE_MAP[intent]
-        # Update sticky agent whenever intent changes (topic switch)
-        if new_agent != active_agent:
-            session_store.set_active_agent(sid, new_agent)
-            active_agent = new_agent
+    # ── Mixed-intent: keep sticky agent when message spans two domains ─────────
+    # Example: "show me plans AND check my ticket" while sticky agent is sales.
+    # The primary agent handles both via its pre-flight inter-agent call.
+    # Without this, intent detection sees "ticket" and switches to complaint,
+    # and the sales pre-flight never runs.
+    elif active_agent and _is_mixed_intent(user_message, active_agent):
+        intent     = active_agent.value
+        request_id = str(uuid.uuid4())
+        print(f"[ORCHESTRATOR] Mixed-intent detected — keeping sticky agent: {active_agent.value}")
+
     else:
-        # Unknown intent — keep sticky agent if we have one, else fail gracefully
-        if not active_agent:
-            return {
-                "intent":       intent,
-                "agent":        None,
-                "request_id":   request_id,
-                "response":     (
-                    "I'm sorry, I couldn't understand your request. "
-                    "Please ask about billing, a complaint, or our products."
-                ),
-                "new_messages": [],
-            }, sid
+        initial_state: OrchestratorState = {
+            "user_message":         user_message,
+            "conversation_history": history,
+            "detected_intent":      "",
+            "target_agent":         active_agent or AgentType.BILLING,
+            "a2a_response":         "",
+            "request_id":           "",
+            "final_response":       "",
+        }
+        intent_state = detect_intent_node(initial_state)
+        intent       = intent_state["detected_intent"]
+        request_id   = intent_state["request_id"]
 
-    # ── Append user message to session ────────────────────────────────────────
+        if intent in VALID_INTENTS:
+            new_agent = AGENT_TYPE_MAP[intent]
+            if new_agent != active_agent:
+                session_store.set_active_agent(sid, new_agent)
+                active_agent = new_agent
+        else:
+            if not active_agent:
+                return {
+                    "intent":     intent,
+                    "agent":      None,
+                    "request_id": request_id,
+                    "response": (
+                        "I'm sorry, I couldn't understand your request. "
+                        "Please ask about billing, a complaint, or our products."
+                    ),
+                }, sid
+
+    # Append user message to session
     session_store.append_messages(sid, [{"type": "human", "content": user_message}])
-    # Refresh history to include the message we just appended
     history = session_store.get_messages(sid)
 
     return {
-        "intent":       intent,
-        "agent":        active_agent,
-        "request_id":   request_id,
-        "history":      history,          # full history including new user msg
+        "intent":     intent,
+        "agent":      active_agent,
+        "request_id": request_id,
+        "history":    history,
     }, sid
 
 
@@ -365,7 +464,7 @@ async def stream_from_orchestrator(
         source_agent=AgentType.INTENT_DETECTOR,
         target_agent=active_agent,
         user_message=user_message,
-        context={"detected_intent": intent},
+        context={"detected_intent": intent, "session_id": sid},
         conversation_history=history,
     )
 
@@ -432,6 +531,19 @@ app = FastAPI(title="Intent Detector — Orchestrator", version="2.0")
 orchestrator: CompiledStateGraph = build_orchestrator_graph()
 
 
+# ── Internal trace receiver (accepts forwarded events from specialist agents) ─
+
+@app.post("/internal/trace")
+async def internal_trace(event: dict) -> dict:
+    """
+    Receive a trace event forwarded from a specialist agent process and
+    store it in the orchestrator's local trace buffer.
+    The dashboard SSE stream reads from this buffer.
+    """
+    trace_emitter.receive(event)
+    return {"status": "ok"}
+
+
 # ── Chat endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/chat/stream")
@@ -453,25 +565,19 @@ async def chat_stream(payload: ChatRequest) -> StreamingResponse:
 @app.post("/chat")
 async def chat(payload: ChatRequest) -> dict:
     """
-    Blocking entry point.
+    Blocking entry point — internally calls /process/stream so all trace
+    events (tool_start, tool_end, agent_handoff) fire during execution.
     Accepts { "message": "...", "session_id": "..." }.
-    Returns {
-        "session_id": "...",
-        "intent": "...",
-        "agent": "...",
-        "request_id": "...",
-        "response": "..."
-    }
+    Returns { "session_id", "intent", "agent", "request_id", "response" }.
     """
     info, sid = await _run_chat(payload.message, payload.session_id)
 
-    # Early exit for unknown intent
     if "response" in info:
         return {
             "session_id": sid,
             "intent":     info["intent"],
             "agent":      None,
-            "request_id": info["request_id"],
+            "request_id": info.get("request_id", ""),
             "response":   info["response"],
         }
 
@@ -479,35 +585,81 @@ async def chat(payload: ChatRequest) -> dict:
     request_id               = info["request_id"]
     history                  = info["history"]
 
+    trace_emitter.emit(sid, "orchestrator_dispatch",
+                       intent=info["intent"],
+                       target_agent=active_agent.value,
+                       request_id=request_id)
+
     req = A2ARequest(
         request_id=request_id,
         source_agent=AgentType.INTENT_DETECTOR,
         target_agent=active_agent,
         user_message=payload.message,
-        context={"detected_intent": info["intent"]},
+        context={"detected_intent": info["intent"], "session_id": sid},
         conversation_history=history,
     )
 
+    # Use /process/stream (not /process) so astream_events fires inside the
+    # agent — this is what causes tool_start/tool_end trace events to emit.
+    base_url   = AGENT_URLS[active_agent]
+    stream_url = base_url.replace("/process", "/process/stream")
+
+    collected_tokens: list[str] = []
+    final_result                = ""
+    hitl_data: dict             = {}
+
     try:
         async with httpx.AsyncClient() as client:
-            url = AGENT_URLS[active_agent]
-            response = await client.post(url, json=req.model_dump(), timeout=30.0)
-            response.raise_for_status()
-            a2a_resp = A2AResponse(**response.json())
-    except Exception as e:
-        return {
-            "session_id": sid,
-            "intent":     info["intent"],
-            "agent":      active_agent.value,
-            "request_id": request_id,
-            "response":   f"Error contacting agent: {e}",
-        }
+            async with client.stream(
+                "POST", stream_url,
+                json=req.model_dump(),
+                timeout=60.0,
+            ) as response:
+                response.raise_for_status()
+                async for raw_line in response.aiter_lines():
+                    if not raw_line.startswith("data:"):
+                        continue
+                    try:
+                        payload_data = json.loads(raw_line[5:].strip())
+                        if payload_data.get("text"):
+                            collected_tokens.append(payload_data["text"])
+                        # Capture hitl_request so we can surface it to the caller
+                        if payload_data.get("question"):
+                            hitl_data = payload_data
+                    except json.JSONDecodeError:
+                        pass
 
-    # Write agent reply back to session
-    if a2a_resp.new_messages:
-        session_store.append_messages(sid, a2a_resp.new_messages)
-    elif a2a_resp.result:
-        session_store.append_messages(sid, [{"type": "ai", "content": a2a_resp.result}])
+        # HITL takes priority — agent suspended waiting for confirmation
+        if hitl_data:
+            final_result = hitl_data.get("question", "Please confirm the action.")
+        else:
+            final_result = "".join(collected_tokens)
+
+    except httpx.ConnectError:
+        final_result = f"The {active_agent.value} agent is currently unavailable. Please try again later."
+    except httpx.TimeoutException:
+        final_result = f"The {active_agent.value} agent took too long to respond. Please try again."
+    except httpx.HTTPStatusError as e:
+        final_result = f"The {active_agent.value} agent returned an error (status {e.response.status_code}). Please try again."
+    except Exception as e:
+        final_result = f"Error contacting agent: {e}"
+
+    # Write AI reply to session
+    if final_result:
+        session_store.append_messages(sid, [{"type": "ai", "content": final_result}])
+
+    # Detect if billing agent signalled a handoff to complaint.
+    # Trigger phrase: "transferring you to our complaint team"
+    # When detected, set pending_handoff so the next user turn routes to complaint.
+    if (active_agent == AgentType.BILLING and
+            final_result and
+            "transferring" in final_result.lower() and
+            "complaint" in final_result.lower()):
+        session_store.set_metadata(sid, "pending_handoff", "complaint")
+        trace_emitter.emit(sid, "pending_handoff_set",
+                           from_agent="billing",
+                           to_agent="complaint",
+                           reason="billing agent signalled transfer to complaint team")
 
     agent_label = {
         AgentType.BILLING:   "Billing Support",
@@ -515,24 +667,27 @@ async def chat(payload: ChatRequest) -> dict:
         AgentType.SALES:     "Sales Support",
     }.get(active_agent, "Support")
 
-    return {
+    result = {
         "session_id": sid,
         "intent":     info["intent"],
         "agent":      active_agent.value,
         "request_id": request_id,
-        "response":   f"[{agent_label}]\n\n{a2a_resp.result}",
+        "response":   f"[{agent_label}]\n\n{final_result}",
     }
+
+    # Surface HITL metadata so the client knows it needs to call /process/resume
+    if hitl_data:
+        result["hitl_pending"]   = True
+        result["hitl_options"]   = hitl_data.get("options", ["Yes", "No"])
+        result["ticket_preview"] = hitl_data.get("ticket_preview", {})
+
+    return result
 
 
 # ── Session management endpoints ──────────────────────────────────────────────
 
 @app.post("/session/reset")
 def session_reset(body: SessionResetRequest) -> dict:
-    """
-    Reset a session's conversation history and sticky agent.
-    Metadata (resolved account_id etc.) is preserved.
-    Returns 404 if the session_id is unknown.
-    """
     ok = session_store.reset(body.session_id)
     if not ok:
         raise HTTPException(status_code=404, detail=f"Session '{body.session_id}' not found.")
@@ -541,7 +696,6 @@ def session_reset(body: SessionResetRequest) -> dict:
 
 @app.delete("/session/{session_id}")
 def session_delete(session_id: str) -> dict:
-    """Delete a session entirely."""
     ok = session_store.delete(session_id)
     if not ok:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
@@ -550,11 +704,54 @@ def session_delete(session_id: str) -> dict:
 
 @app.get("/session/{session_id}")
 def session_info(session_id: str) -> dict:
-    """Inspect a session — useful for debugging."""
     info = session_store.session_info(session_id)
     if info is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
     return info
+
+
+# ── Trace endpoint (dashboard) ────────────────────────────────────────────────
+
+@app.get("/chat/trace/{session_id}")
+async def chat_trace(session_id: str) -> StreamingResponse:
+    """
+    Real-time execution trace stream for the dashboard.
+
+    Subscribe to this SSE endpoint alongside /chat/stream to power a live
+    dashboard showing which agent is active, which tools are running, and
+    internal agent-to-agent handoffs — including during internal calls that
+    are invisible on the user-facing stream.
+
+    Each SSE data payload is a JSON object:
+        {"type": "agent_start"|"agent_end"|"tool_start"|"tool_end"|
+                 "agent_handoff"|"hitl_requested"|"hitl_resumed"|"error",
+         "session_id": "...",
+         "ts": "<ISO-8601 UTC>",
+         ...event-specific fields...}
+
+    The stream stays open until the session is idle for 5 minutes or the
+    client disconnects.
+    """
+    if session_store.get(session_id) is None:
+        raise HTTPException(status_code=404,
+                            detail=f"Session '{session_id}' not found.")
+    return StreamingResponse(
+        trace_emitter.stream(session_id, timeout_s=300),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/chat/trace/{session_id}/replay")
+def chat_trace_replay(session_id: str) -> dict:
+    """
+    Return all buffered trace events for a session as a JSON array.
+    Useful for replaying a completed session's execution graph in the dashboard.
+    """
+    if session_store.get(session_id) is None:
+        raise HTTPException(status_code=404,
+                            detail=f"Session '{session_id}' not found.")
+    return {"session_id": session_id, "events": trace_emitter.get_events(session_id)}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
