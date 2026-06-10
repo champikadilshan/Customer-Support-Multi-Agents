@@ -42,7 +42,6 @@ class TicketCreate(BaseModel):
 
 
 class TicketUpdate(BaseModel):
-    """Used for PATCH — all fields optional, only provided ones are updated."""
     status:      Optional[TicketStatus] = None
     category:    Optional[str]          = None
     priority:    Optional[str]          = None
