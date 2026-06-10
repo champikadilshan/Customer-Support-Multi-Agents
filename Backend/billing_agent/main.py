@@ -1,12 +1,7 @@
-"""
-billing_agent/main.py  (v3 — multi-agent collaboration + trace)
-"""
-
 import json
 import operator
 import sys
 import os
-import time
 import uvicorn
 
 from fastapi import FastAPI
@@ -31,8 +26,6 @@ from sqlmodel import select
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
-# ── LangGraph state ───────────────────────────────────────────────────────────
-
 class BillingState(TypedDict):
     request_id:     str
     user_message:   str
@@ -43,8 +36,6 @@ class BillingState(TypedDict):
     messages:       Annotated[list[BaseMessage], operator.add]
     final_response: str
 
-
-# ── Own tools ─────────────────────────────────────────────────────────────────
 
 @tool(
     "get_account_balance",
@@ -86,8 +77,10 @@ def get_invoice_history(account_id: str) -> list[dict]:
             .order_by(Invoice.date.desc())
             .limit(5)
         ).all()
+
     if not rows:
         return [{"error": f"No invoices found for account_id '{account_id}'"}]
+
     return [
         {"invoice_id": r.invoice_id, "date": r.date, "amount": r.amount, "status": r.status}
         for r in rows
@@ -104,21 +97,21 @@ def get_invoice_history(account_id: str) -> list[dict]:
 )
 def get_payment_methods(account_id: str) -> dict:
     with get_session() as session:
-        rows = session.exec(
-            select(PaymentMethod).where(PaymentMethod.account_id == account_id)
-        ).all()
+        rows = session.exec( select(PaymentMethod).where(PaymentMethod.account_id == account_id) ).all()
+
     if not rows:
         return {"error": f"No payment methods found for account_id '{account_id}'"}
+
     methods = []
+
     for row in rows:
         entry = {"type": row.type, "last4": row.last4, "default": row.is_default}
         if row.expiry: entry["expiry"] = row.expiry
         if row.bank:   entry["bank"]   = row.bank
         methods.append(entry)
+
     return {"account_id": account_id, "payment_methods": methods}
 
-
-# ── Inter-agent tool (unbound — args injected per-request in agent_node) ─────
 
 _call_complaint_agent_tool = make_agent_call_tool(
     target=AgentType.COMPLAINT,
@@ -133,11 +126,7 @@ _call_complaint_agent_tool = make_agent_call_tool(
 
 OWN_TOOLS = [get_account_balance, get_invoice_history, get_payment_methods]
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
-
 llm = get_vertex_llm(temperature=0)
-
-# ── System prompts ────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a helpful and professional billing support agent for a telecommunications company.
 
@@ -166,8 +155,6 @@ Do NOT greet. Do NOT add pleasantries. Just fetch the data and return the facts.
 Use account_id 'ACC-001' as default if none is specified in the task."""
 
 
-# ── Nodes ─────────────────────────────────────────────────────────────────────
-
 def agent_node(state: BillingState) -> BillingState:
     is_internal   = state.get("is_internal", False)
     session_id    = state.get("session_id", "")
@@ -176,8 +163,6 @@ def agent_node(state: BillingState) -> BillingState:
 
     system_prompt = INTERNAL_PROMPT if is_internal else USER_FACING_PROMPT
 
-    # For user-facing turns, bind the inter-agent tool with injected context.
-    # For internal turns, suppress it to prevent recursive chains.
     if is_internal:
         all_tools = OWN_TOOLS
     else:
@@ -191,11 +176,10 @@ def agent_node(state: BillingState) -> BillingState:
 
     llm_with_tools = llm.bind_tools(all_tools)
 
-    messages_with_system = [
-        {"role": "system", "content": system_prompt},
-        *state["messages"],
-    ]
+    messages_with_system = [ {"role": "system", "content": system_prompt},*state["messages"],  ]
+
     response = llm_with_tools.invoke(messages_with_system)
+
     return {"messages": [response]}
 
 
@@ -206,15 +190,11 @@ def format_response_node(state: BillingState) -> BillingState:
             break
     else:
         final = "I was unable to retrieve billing information at this time. Please try again."
+
     return {**state, "final_response": final}
 
 
-# ── Build graph ───────────────────────────────────────────────────────────────
-
 def build_billing_graph() -> CompiledStateGraph:
-    # ToolNode is created with a placeholder; actual tools are bound per-request
-    # in agent_node so the loop guard and arg injection work correctly.
-    # We pass OWN_TOOLS here so ToolNode knows how to execute them by name.
     all_possible_tools = [*OWN_TOOLS, _call_complaint_agent_tool]
 
     graph = StateGraph(BillingState)
@@ -231,8 +211,6 @@ def build_billing_graph() -> CompiledStateGraph:
     return graph.compile()
 
 
-# ── SSE helpers ───────────────────────────────────────────────────────────────
-
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
@@ -246,17 +224,10 @@ def _extract_text(content) -> str:
     return ""
 
 
-# ── Streaming generator ───────────────────────────────────────────────────────
-
-async def stream_billing_graph(
-    req:   A2ARequest,
-    graph: CompiledStateGraph,
-) -> AsyncIterator[str]:
+async def stream_billing_graph( req:   A2ARequest, graph: CompiledStateGraph,) -> AsyncIterator[str]:
     session_id = req.context.get("session_id", req.request_id)
 
-    trace_emitter.emit(session_id, "agent_start", agent="billing",
-                       is_internal=req.is_internal,
-                       triggered_by=req.calling_agent or "orchestrator")
+    trace_emitter.emit(session_id, "agent_start", agent="billing", is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
 
     prior_messages = dicts_to_messages(req.conversation_history)
     if not prior_messages or not isinstance(prior_messages[-1], HumanMessage):
@@ -280,20 +251,20 @@ async def stream_billing_graph(
 
             if kind == "on_tool_start":
                 tool_name = event.get("name", "unknown_tool")
-                trace_emitter.emit(session_id, "tool_start",
-                                   agent="billing", tool=tool_name)
+                trace_emitter.emit(session_id, "tool_start", agent="billing", tool=tool_name)
+
                 if not req.is_internal:
                     yield _sse("tool_call", {"tool": tool_name})
 
             elif kind == "on_tool_end":
                 tool_name = event.get("name", "unknown_tool")
-                trace_emitter.emit(session_id, "tool_end",
-                                   agent="billing", tool=tool_name)
+                trace_emitter.emit(session_id, "tool_end",   agent="billing", tool=tool_name)
 
             elif kind == "on_chat_model_stream":
                 chunk = event["data"].get("chunk")
                 if chunk is None:
                     continue
+
                 text = _extract_text(chunk.content)
                 if text and not req.is_internal:
                     yield _sse("token", {"text": text})
@@ -302,6 +273,7 @@ async def stream_billing_graph(
                 chunk = event.get("data", {}).get("chunk")
                 if not isinstance(chunk, dict):
                     continue
+
                 text = chunk.get("final_response", "")
                 if isinstance(text, str) and text and not req.is_internal:
                     yield _sse("token", {"text": text})
@@ -321,8 +293,6 @@ async def stream_billing_graph(
         if not req.is_internal:
             yield _sse("error", {"message": str(exc)})
 
-
-# ── FastAPI ───────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Billing Agent", version="3.0")
 billing_graph: CompiledStateGraph = build_billing_graph()
