@@ -89,12 +89,7 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
     : data.detail ?? meta.description
 
   return (
-    <div
-      className={cn(
-        "relative h-full w-full overflow-hidden transition-opacity duration-500",
-        data.dimmed && "opacity-40"
-      )}
-    >
+    <div className="relative h-full w-full overflow-hidden">
       <FlowNodeHandles />
 
       <div
@@ -202,4 +197,14 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
   )
 }
 
-export const AgentFlowNode = memo(AgentFlowNodeComponent)
+export const AgentFlowNode = memo(
+  AgentFlowNodeComponent,
+  (prev, next) =>
+    prev.data.dimmed === next.data.dimmed &&
+    prev.data.status === next.data.status &&
+    prev.data.highlighted === next.data.highlighted &&
+    prev.data.detail === next.data.detail &&
+    prev.data.runningTool === next.data.runningTool &&
+    prev.data.health === next.data.health &&
+    prev.data.nodeId === next.data.nodeId
+)

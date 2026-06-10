@@ -1,14 +1,62 @@
 "use client"
 
-import { memo } from "react"
+import { memo, useMemo } from "react"
 import {
   getSmoothStepPath,
+  useInternalNode,
   type EdgeProps,
 } from "@xyflow/react"
 
 import type { TraceEdgeData } from "@/lib/agent-flow-elements"
 
+type PathSegment = {
+  d: string
+  key: string
+}
+
+function buildSegmentedCollabPaths(
+  source: string,
+  target: string,
+  sourceX: number,
+  sourceY: number,
+  targetX: number,
+  targetY: number,
+  complaintLeftX: number,
+  complaintRightX: number
+): PathSegment[] {
+  const billingToSales = source === "billing" && target === "sales"
+  const salesToBilling = source === "sales" && target === "billing"
+  if (!billingToSales && !salesToBilling) return []
+
+  if (billingToSales) {
+    return [
+      {
+        key: "before",
+        d: `M ${sourceX},${sourceY} L ${complaintLeftX},${sourceY}`,
+      },
+      {
+        key: "after",
+        d: `M ${complaintRightX},${sourceY} L ${targetX},${targetY}`,
+      },
+    ]
+  }
+
+  return [
+    {
+      key: "before",
+      d: `M ${sourceX},${sourceY} L ${complaintRightX},${sourceY}`,
+    },
+    {
+      key: "after",
+      d: `M ${complaintLeftX},${sourceY} L ${targetX},${targetY}`,
+    },
+  ]
+}
+
 function TraceEdgeComponent({
+  id,
+  source,
+  target,
   sourceX,
   sourceY,
   targetX,
@@ -20,9 +68,7 @@ function TraceEdgeComponent({
   const kind = (data as TraceEdgeData | undefined)?.kind ?? "route"
   const status = (data as TraceEdgeData | undefined)?.status ?? "idle"
   const visible = (data as TraceEdgeData | undefined)?.visible !== false
-
-  if (!visible) return null
-
+  const complaintNode = useInternalNode("complaint")
   const isCollab = kind === "collaboration"
 
   const [path] = getSmoothStepPath({
@@ -35,6 +81,41 @@ function TraceEdgeComponent({
     borderRadius: 14,
     offset: isCollab ? 24 : kind === "route" ? 8 : 4,
   })
+
+  const paths = useMemo(() => {
+    if (!isCollab || !complaintNode?.internals.positionAbsolute) {
+      return [{ key: "full", d: path }]
+    }
+
+    const leftX = complaintNode.internals.positionAbsolute.x
+    const width = complaintNode.measured.width ?? 210
+    const rightX = leftX + width
+
+    const segmented = buildSegmentedCollabPaths(
+      source,
+      target,
+      sourceX,
+      sourceY,
+      targetX,
+      targetY,
+      leftX,
+      rightX
+    )
+
+    return segmented.length > 0 ? segmented : [{ key: "full", d: path }]
+  }, [
+    complaintNode,
+    isCollab,
+    path,
+    source,
+    target,
+    sourceX,
+    sourceY,
+    targetX,
+    targetY,
+  ])
+
+  if (!visible) return null
 
   const isActive = status === "active"
   const isCompleted = status === "completed"
@@ -64,25 +145,28 @@ function TraceEdgeComponent({
 
   return (
     <g opacity={opacity}>
-      <path
-        d={path}
-        fill="none"
-        stroke={stroke}
-        strokeWidth={isActive ? 3 : isCollab ? 1.75 : 2}
-        strokeDasharray={isActive && !isCollab ? "10 8" : idleDasharray}
-        strokeLinecap="round"
-        className="transition-[stroke,stroke-width,opacity] duration-300 ease-out"
-      >
-        {isActive && !isCollab ? (
-          <animate
-            attributeName="stroke-dashoffset"
-            from="0"
-            to="-36"
-            dur="0.8s"
-            repeatCount="indefinite"
-          />
-        ) : null}
-      </path>
+      {paths.map((segment) => (
+        <path
+          key={`${id}-${segment.key}`}
+          d={segment.d}
+          fill="none"
+          stroke={stroke}
+          strokeWidth={isActive ? 3 : isCollab ? 1.75 : 2}
+          strokeDasharray={isActive && !isCollab ? "10 8" : idleDasharray}
+          strokeLinecap="round"
+          className="transition-[stroke,stroke-width,opacity] duration-300 ease-out"
+        >
+          {isActive && !isCollab && segment.key === "full" ? (
+            <animate
+              attributeName="stroke-dashoffset"
+              from="0"
+              to="-36"
+              dur="0.8s"
+              repeatCount="indefinite"
+            />
+          ) : null}
+        </path>
+      ))}
       {isActive && !isCollab ? (
         <circle r="4" fill={stroke} pointerEvents="none">
           <animateMotion dur="0.8s" repeatCount="indefinite" path={path} />

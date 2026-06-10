@@ -41,14 +41,26 @@ function getStaticEdgeStatus(
   return getEdgeStatus(graph, edge.from, edge.to)
 }
 
+const SPECIALIST_AGENTS: AgentNodeId[] = ["billing", "complaint", "sales"]
+
 function isAgentDimmed(graph: AgentGraphState, nodeId: AgentNodeId) {
-  const kind = NODE_KIND[nodeId]
-  if (kind !== "agent") return false
+  if (NODE_KIND[nodeId] !== "agent") return false
+  if (!SPECIALIST_AGENTS.includes(nodeId)) return false
+
+  const status = graph.nodes[nodeId].status
+  if (status === "active" || status === "waiting") return false
+
+  const anotherSpecialistActive = SPECIALIST_AGENTS.some(
+    (id) =>
+      id !== nodeId &&
+      (graph.nodes[id].status === "active" || graph.nodes[id].status === "waiting")
+  )
+  if (anotherSpecialistActive) return true
 
   return (
-    graph.routedAgent !== nodeId &&
     Boolean(graph.routedAgent) &&
-    graph.nodes[nodeId].status === "idle"
+    graph.routedAgent !== nodeId &&
+    (status === "idle" || status === "completed")
   )
 }
 
@@ -63,16 +75,19 @@ export function buildFlowNodes(
     const layout = NODE_LAYOUT[nodeId]
     const node = graph.nodes[nodeId]
 
+    const dimmed = isAgentDimmed(graph, nodeId)
+
     return {
       id: nodeId,
       type: "agentFlow",
       position: { x: layout.x, y: layout.y },
+      className: dimmed ? "agent-flow-node--dimmed" : undefined,
       data: {
         nodeId,
         status: node.status,
         detail: node.detail,
         runningTool: node.runningTools.at(-1),
-        dimmed: isAgentDimmed(graph, nodeId),
+        dimmed,
         highlighted: options?.highlightNodeId === nodeId,
         health: options?.health?.[nodeId],
         kind: NODE_KIND[nodeId],
