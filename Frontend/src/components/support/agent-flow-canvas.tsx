@@ -92,6 +92,8 @@ function AgentFlowGraph({
       nodesDraggable={false}
       nodesConnectable={false}
       elementsSelectable={false}
+      elevateEdgesOnSelect={false}
+      elevateNodesOnSelect={false}
       panOnDrag
       panOnScroll={false}
       zoomOnScroll

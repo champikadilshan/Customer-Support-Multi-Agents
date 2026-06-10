@@ -13,10 +13,9 @@ export function SupportChat() {
     handleInputChange,
     handleSubmit,
     stop,
-    isGenerating,
+    isLoading,
     isHitlPending,
     activeAgent,
-    activeIntent,
     respondToHitl,
   } = useSupportChat()
 
@@ -29,10 +28,9 @@ export function SupportChat() {
           input={input}
           handleInputChange={handleInputChange}
           handleSubmit={handleSubmit}
-          isGenerating={isGenerating}
+          isGenerating={isLoading}
           isHitlPending={isHitlPending}
           activeAgent={activeAgent}
-          activeIntent={activeIntent}
           respondToHitl={respondToHitl}
           stop={stop}
         />

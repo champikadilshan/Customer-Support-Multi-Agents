@@ -150,7 +150,9 @@ def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
             history=req.conversation_history,
         )
         tools = [*mcp_tools, bound_complaint, bound_billing]
-    return {t.name: t for t in tools}
+
+    # Guard: only include objects that have a .name attribute
+    return {t.name: t for t in tools if hasattr(t, "name") and t.name}
 
 
 # ── Streaming generator ───────────────────────────────────────────────────────

@@ -39,11 +39,16 @@ export function SupportWorkspace() {
               size="sm"
               className="h-8 gap-1.5 text-muted-foreground"
               onClick={() => void chat.resetSession()}
-              disabled={chat.isGenerating || chat.isHitlPending || chat.isResetting}
-              aria-label="Reset chat session"
+              disabled={
+                chat.isLoading ||
+                chat.isHitlPending ||
+                chat.isResetting ||
+                chat.isRestoringSession
+              }
+              aria-label="Start new conversation"
             >
               <RotateCcw className="h-3.5 w-3.5" />
-              Reset
+              New conversation
             </Button>
           </div>
 
@@ -53,10 +58,9 @@ export function SupportWorkspace() {
             input={chat.input}
             handleInputChange={chat.handleInputChange}
             handleSubmit={chat.handleSubmit}
-            isGenerating={chat.isGenerating}
+            isGenerating={chat.isLoading}
             isHitlPending={chat.isHitlPending}
             activeAgent={chat.activeAgent}
-            activeIntent={chat.activeIntent}
             respondToHitl={chat.respondToHitl}
             stop={chat.stop}
           />

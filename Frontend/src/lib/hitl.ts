@@ -14,6 +14,23 @@ export type HitlRequest = {
   options: string[]
 }
 
+/** Client-side HITL gate state (from POST /chat response). */
+export type HitlPending = {
+  request_id: string
+  ticket_preview: TicketPreview
+  hitl_question: string
+  hitl_options: string[]
+}
+
+export function hitlPendingToRequest(pending: HitlPending): HitlRequest {
+  return {
+    request_id: pending.request_id,
+    question: pending.hitl_question,
+    ticket_preview: pending.ticket_preview,
+    options: pending.hitl_options,
+  }
+}
+
 export function formatHitlCategory(category?: string) {
   if (!category) return null
   return category.replace(/_/g, " ")

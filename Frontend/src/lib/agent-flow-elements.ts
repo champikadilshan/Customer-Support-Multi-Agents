@@ -38,17 +38,7 @@ function getStaticEdgeStatus(
   graph: AgentGraphState,
   edge: StaticEdge
 ): EdgeStatus {
-  if (edge.kind === "route" || edge.kind === "data" || edge.kind === "pipeline") {
-    return getEdgeStatus(graph, edge.from, edge.to)
-  }
-
-  const handoff = graph.handoffs.find(
-    (item) =>
-      mapHandoffToNodeId(item.from) === edge.from &&
-      mapHandoffToNodeId(item.to) === edge.to
-  )
-
-  return handoff?.status ?? "idle"
+  return getEdgeStatus(graph, edge.from, edge.to)
 }
 
 function isAgentDimmed(graph: AgentGraphState, nodeId: AgentNodeId) {
@@ -94,15 +84,25 @@ export function buildFlowNodes(
       draggable: false,
       selectable: false,
       connectable: false,
+      zIndex: 1,
     }
   })
+}
+
+function edgeVisibility(
+  kind: StaticEdge["kind"],
+  status: EdgeStatus,
+  graph: AgentGraphState
+): boolean {
+  if (kind === "pipeline") return graph.showComplaintFlow
+  if (kind === "collaboration") return status === "active" || status === "completed"
+  return true
 }
 
 export function buildFlowEdges(graph: AgentGraphState): Edge<TraceEdgeData>[] {
   const staticEdges: Edge<TraceEdgeData>[] = STATIC_EDGES.map((edge) => {
     const status = getStaticEdgeStatus(graph, edge)
-    const isPipeline = edge.kind === "pipeline"
-    const visible = !isPipeline || graph.showComplaintFlow
+    const visible = edgeVisibility(edge.kind, status, graph)
 
     return {
       id: edge.id,
@@ -111,12 +111,12 @@ export function buildFlowEdges(graph: AgentGraphState): Edge<TraceEdgeData>[] {
       sourceHandle: edge.sourceHandle,
       targetHandle: edge.targetHandle,
       type: "trace",
+      zIndex: 0,
       data: {
         kind: edge.kind,
         status,
         visible,
       },
-      animated: status === "active",
       selectable: false,
       focusable: false,
     }
@@ -127,12 +127,12 @@ export function buildFlowEdges(graph: AgentGraphState): Edge<TraceEdgeData>[] {
       const from = mapHandoffToNodeId(handoff.from)
       const to = mapHandoffToNodeId(handoff.to)
       if (!from || !to || from === to) return null
+      if (handoff.status === "idle") return null
 
-      const isStaticCollab = STATIC_EDGES.some(
-        (edge) =>
-          edge.kind === "collaboration" && edge.from === from && edge.to === to
+      const hasStaticEdge = STATIC_EDGES.some(
+        (edge) => edge.from === from && edge.to === to
       )
-      if (isStaticCollab) return null
+      if (hasStaticEdge) return null
 
       return {
         id: `handoff-${handoff.from}-${handoff.to}`,
@@ -141,12 +141,12 @@ export function buildFlowEdges(graph: AgentGraphState): Edge<TraceEdgeData>[] {
         sourceHandle: "right",
         targetHandle: "left",
         type: "trace",
+        zIndex: 0,
         data: {
           kind: "collaboration" as const,
           status: handoff.status,
           visible: true,
         },
-        animated: handoff.status === "active",
         selectable: false,
         focusable: false,
       }
