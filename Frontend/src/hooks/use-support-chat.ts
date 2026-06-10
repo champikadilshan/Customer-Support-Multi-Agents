@@ -228,6 +228,7 @@ export function useSupportChat() {
       setMessages((current) => [...current, userMessage, loadingAssistant])
       setInput("")
       setIsLoading(true)
+      resetGraph()
 
       if (sessionId) {
         connectTrace(sessionId)
@@ -297,6 +298,7 @@ export function useSupportChat() {
       isResetting,
       isRestoringSession,
       refreshActiveAgent,
+      resetGraph,
       sessionId,
       updateMessage,
     ]
@@ -362,6 +364,7 @@ export function useSupportChat() {
       })
 
       setIsLoading(true)
+      resetGraph()
 
       if (sessionId) {
         connectTrace(sessionId)
@@ -398,6 +401,7 @@ export function useSupportChat() {
       handleResumeEvent,
       hitlPending,
       isLoading,
+      resetGraph,
       sessionId,
     ]
   )

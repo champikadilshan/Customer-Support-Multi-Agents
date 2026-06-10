@@ -61,6 +61,7 @@ export function SupportWorkspace() {
             isGenerating={chat.isLoading}
             isHitlPending={chat.isHitlPending}
             activeAgent={chat.activeAgent}
+            agentGraph={chat.agentGraph}
             respondToHitl={chat.respondToHitl}
             stop={chat.stop}
           />

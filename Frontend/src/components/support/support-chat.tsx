@@ -16,6 +16,7 @@ export function SupportChat() {
     isLoading,
     isHitlPending,
     activeAgent,
+    agentGraph,
     respondToHitl,
   } = useSupportChat()
 
@@ -31,6 +32,7 @@ export function SupportChat() {
           isGenerating={isLoading}
           isHitlPending={isHitlPending}
           activeAgent={activeAgent}
+          agentGraph={agentGraph}
           respondToHitl={respondToHitl}
           stop={stop}
         />
