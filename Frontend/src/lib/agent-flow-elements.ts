@@ -89,20 +89,10 @@ export function buildFlowNodes(
   })
 }
 
-function edgeVisibility(
-  kind: StaticEdge["kind"],
-  status: EdgeStatus,
-  graph: AgentGraphState
-): boolean {
-  if (kind === "pipeline") return graph.showComplaintFlow
-  if (kind === "collaboration") return status === "active" || status === "completed"
-  return true
-}
-
 export function buildFlowEdges(graph: AgentGraphState): Edge<TraceEdgeData>[] {
   const staticEdges: Edge<TraceEdgeData>[] = STATIC_EDGES.map((edge) => {
     const status = getStaticEdgeStatus(graph, edge)
-    const visible = edgeVisibility(edge.kind, status, graph)
+    const visible = true
 
     return {
       id: edge.id,

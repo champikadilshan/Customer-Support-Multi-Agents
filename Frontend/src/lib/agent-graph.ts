@@ -33,7 +33,7 @@ export type GraphEdge = {
   from: AgentNodeId
   to: AgentNodeId
   status: EdgeStatus
-  kind: "route" | "collaboration" | "data" | "pipeline"
+  kind: "route" | "collaboration" | "data"
 }
 
 export type GraphHandoff = {
@@ -60,7 +60,6 @@ export type AgentGraphState = {
   handoffs: GraphHandoff[]
   activities: GraphActivity[]
   routedAgent: AgentNodeId | null
-  showComplaintFlow: boolean
   traceConnected: boolean
   lastEventAt: number | null
 }
@@ -104,7 +103,7 @@ export const AGENT_NODES: Record<
   },
   hitl: {
     label: "Human Review",
-    description: "Approval gate before ticket create",
+    description: "HITL approval gate",
   },
   billing_db: {
     label: "SQLite DB",
@@ -135,15 +134,17 @@ const BASE_EDGES: GraphEdge[] = [
   { id: "route-complaint", from: "intent_detector", to: "complaint", status: "idle", kind: "route" },
   { id: "route-sales", from: "intent_detector", to: "sales", status: "idle", kind: "route" },
   { id: "data-billing-db", from: "billing", to: "billing_db", status: "idle", kind: "data" },
-  { id: "data-sales-mcp", from: "sales", to: "sales_mcp", status: "idle", kind: "data" },
-  { id: "data-mcp-neo4j", from: "sales_mcp", to: "product_db", status: "idle", kind: "data" },
+  { id: "pipe-complaint-hitl", from: "complaint", to: "hitl", status: "idle", kind: "data" },
   { id: "data-complaint-api", from: "complaint", to: "ticket_api", status: "idle", kind: "data" },
   { id: "data-api-db", from: "ticket_api", to: "ticket_db", status: "idle", kind: "data" },
-  { id: "pipe-complaint-hitl", from: "complaint", to: "hitl", status: "idle", kind: "pipeline" },
-  { id: "pipe-hitl-api", from: "hitl", to: "ticket_api", status: "idle", kind: "pipeline" },
-  { id: "collab-b-c", from: "billing", to: "complaint", status: "idle", kind: "collaboration" },
-  { id: "collab-c-s", from: "complaint", to: "sales", status: "idle", kind: "collaboration" },
-  { id: "collab-s-b", from: "sales", to: "billing", status: "idle", kind: "collaboration" },
+  { id: "data-sales-mcp", from: "sales", to: "sales_mcp", status: "idle", kind: "data" },
+  { id: "data-mcp-neo4j", from: "sales_mcp", to: "product_db", status: "idle", kind: "data" },
+  { id: "collab-b-to-c", from: "billing", to: "complaint", status: "idle", kind: "collaboration" },
+  { id: "collab-c-to-b", from: "complaint", to: "billing", status: "idle", kind: "collaboration" },
+  { id: "collab-c-to-s", from: "complaint", to: "sales", status: "idle", kind: "collaboration" },
+  { id: "collab-s-to-c", from: "sales", to: "complaint", status: "idle", kind: "collaboration" },
+  { id: "collab-s-to-b", from: "sales", to: "billing", status: "idle", kind: "collaboration" },
+  { id: "collab-b-to-s", from: "billing", to: "sales", status: "idle", kind: "collaboration" },
 ]
 
 function createIdleNode(): GraphNodeState {
@@ -172,7 +173,6 @@ export function createInitialAgentGraphState(): AgentGraphState {
     handoffs: [],
     activities: [],
     routedAgent: null,
-    showComplaintFlow: false,
     traceConnected: false,
     lastEventAt: null,
   }

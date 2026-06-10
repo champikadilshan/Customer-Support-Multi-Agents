@@ -11,6 +11,7 @@ import {
 } from "@/lib/agent-graph"
 import {
   formatToolLabel,
+  INTER_AGENT_TOOL_TARGETS,
   isInterAgentTool,
   TOOL_INFRA_ACTIVATION,
 } from "@/lib/agent-tools"
@@ -159,15 +160,6 @@ function activateToolInfra(state: AgentGraphState, tool: string): AgentGraphStat
     next = setEdge(next, from, to, "active")
   }
 
-  if (
-    tool === "get_complaint_history" ||
-    tool === "get_ticket_status" ||
-    tool === "stage_ticket_creation" ||
-    tool === "create_ticket"
-  ) {
-    next = { ...next, showComplaintFlow: true }
-  }
-
   return next
 }
 
@@ -203,7 +195,6 @@ function activatePrimaryRoute(
   next = {
     ...next,
     routedAgent: agentId,
-    showComplaintFlow: agentId === "complaint",
   }
 
   for (const specialist of ["billing", "complaint", "sales"] as AgentNodeId[]) {
@@ -340,6 +331,10 @@ export function reduceAgentGraphOnTraceEvent(
           runningTools: [],
           completedTools: next.nodes[agentId].completedTools,
         })
+        if (agentId === "complaint") {
+          next = setNode(next, "hitl", "waiting", "Awaiting human input")
+          next = setEdge(next, "complaint", "hitl", "active")
+        }
       } else if (event.status === "success") {
         next = setNode(next, agentId, "completed", "Done", {
           runningTools: [],
@@ -402,7 +397,12 @@ export function reduceAgentGraphOnTraceEvent(
 
       next = markToolRunning(next, agentId, event.tool)
 
-      if (!isInterAgentTool(event.tool)) {
+      if (isInterAgentTool(event.tool)) {
+        const target = INTER_AGENT_TOOL_TARGETS[event.tool]
+        if (target) {
+          next = setEdge(next, agentId, target, "active")
+        }
+      } else {
         next = activateToolInfra(next, event.tool)
       }
       break
@@ -414,14 +414,18 @@ export function reduceAgentGraphOnTraceEvent(
 
       next = markToolCompleted(next, agentId, event.tool)
 
-      if (!isInterAgentTool(event.tool)) {
+      if (isInterAgentTool(event.tool)) {
+        const target = INTER_AGENT_TOOL_TARGETS[event.tool]
+        if (target) {
+          next = setEdge(next, agentId, target, "completed")
+        }
+      } else {
         next = completeToolInfra(next, event.tool)
       }
       break
     }
 
     case "hitl_requested":
-      next = { ...next, showComplaintFlow: true }
       next = setNode(next, "complaint", "waiting", "Awaiting approval")
       next = setNode(next, "hitl", "waiting", "Awaiting approval")
       next = setEdge(next, "complaint", "hitl", "active")
@@ -439,7 +443,7 @@ export function reduceAgentGraphOnTraceEvent(
       if (approved) {
         next = setNode(next, "ticket_api", "active", "Creating ticket...")
         next = setNode(next, "ticket_db", "active", "Persisting ticket...")
-        next = setEdge(next, "hitl", "ticket_api", "active")
+        next = setEdge(next, "complaint", "ticket_api", "active")
         next = setEdge(next, "ticket_api", "ticket_db", "active")
       }
       break

@@ -41,6 +41,8 @@ function healthDotClass(health?: HealthStatus) {
       return "bg-emerald-500"
     case "down":
       return "bg-destructive"
+    case "unknown":
+      return "bg-amber-400"
     default:
       return "bg-muted-foreground/50"
   }
@@ -130,7 +132,15 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
               "absolute right-2.5 top-2.5 h-2.5 w-2.5 rounded-full",
               healthDotClass(data.health)
             )}
-            title={data.health === "healthy" ? "Healthy" : data.health === "down" ? "Down" : "Unknown"}
+            title={
+              data.health === "healthy"
+                ? "Healthy"
+                : data.health === "down"
+                  ? "Down"
+                  : data.health === "unknown"
+                    ? "Running (no /health endpoint)"
+                    : "Unknown"
+            }
           />
         ) : null}
 
