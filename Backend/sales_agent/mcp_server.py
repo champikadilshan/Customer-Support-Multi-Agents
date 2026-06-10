@@ -1,15 +1,3 @@
-"""
-Sales MCP Server — exposes Neo4j product graph as MCP tools.
-
-The LangGraph sales agent connects to this server via SSE transport
-and discovers tools automatically through the MCP protocol.
-
-Start with:
-    python sales_agent/mcp_server.py
-
-The server listens on SALES_MCP_PORT (default 8005).
-The SSE endpoint the agent connects to is: http://localhost:8005/sse
-"""
 import sys, os
 import uvicorn
 
@@ -20,7 +8,6 @@ from shared.config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, SALES_MCP_P
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# NEO4J DRIVER — created once reused across all tool calls
 try:
     driver = GraphDatabase.driver(NEO4J_URI,auth=(NEO4J_USERNAME, NEO4J_PASSWORD),)
     driver.verify_connectivity()
@@ -32,11 +19,6 @@ except (ServiceUnavailable, AuthError) as e:
 
 
 def run_query(cypher: str, params: dict = {}) -> list[dict]:
-    """
-    Execute a Cypher query and return results as a list of plain dicts.
-    Raises RuntimeError if driver is not available so MCP returns an error
-    message back to the LLM rather than crashing silently.
-    """
     if driver is None:
         raise RuntimeError("Neo4j connection is unavailable")
 
@@ -45,11 +27,9 @@ def run_query(cypher: str, params: dict = {}) -> list[dict]:
         return [dict(record) for record in result]
 
 
-# MCP SERVER | Tools defined here — NOT in the agent, The LLM discovers these automatically when the agent connects via SSE.
 mcp = FastMCP("Sales MCP")
 
 
-# TOOL 1 — Product catalogue
 @mcp.tool(
     description=(
         "Retrieve products available in a given category with descriptions and prices. "
@@ -87,7 +67,6 @@ def get_product_catalog(category: str) -> list[dict]:
         return [{"error": str(e)}]
 
 
-# TOOL 2 — Active promotions
 @mcp.tool(
     description=(
         "Retrieve all currently active promotions, discounts, and special offers. "
@@ -130,7 +109,6 @@ def get_active_promotions(product_id: str = "") -> list[dict]:
         return [{"error": str(e)}]
 
 
-# TOOL 3 — Product availability
 @mcp.tool(
     description=(
         "Check whether a specific product is currently available and how quickly it can be activated. "
@@ -166,7 +144,6 @@ def check_product_availability(product_id: str) -> dict:
         return {"error": str(e)}
 
 
-# ASGI APP — expose the FastMCP SSE app for uvicorn
 app = mcp.sse_app()
 
 if __name__ == "__main__":

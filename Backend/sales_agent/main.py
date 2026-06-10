@@ -1,7 +1,3 @@
-"""
-sales_agent/main.py  (v4 — agentic loop, no LangGraph)
-"""
-
 import json
 import re as _re
 import sys
@@ -14,7 +10,6 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from typing import AsyncIterator
-
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import SALES_AGENT_PORT, AGENT_HOST, SALES_MCP_PORT
 from shared.llm import get_vertex_llm
@@ -25,16 +20,12 @@ from shared.trace_emitter import trace_emitter
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# ── MCP client ────────────────────────────────────────────────────────────────
-
 mcp_client = MultiServerMCPClient({
     "sales": {
         "url":       f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse",
         "transport": "sse",
     }
 })
-
-# ── Inter-agent tools ─────────────────────────────────────────────────────────
 
 _call_complaint_agent_tool = make_agent_call_tool(
     target=AgentType.COMPLAINT,
@@ -53,21 +44,19 @@ _call_billing_agent_tool = make_agent_call_tool(
     ),
 )
 
-# ── LLM + runtime globals ─────────────────────────────────────────────────────
-
 llm       = get_vertex_llm(temperature=0)
 mcp_tools: list = []
-
-# ── Ticket detection for pre-flight ──────────────────────────────────────────
 
 _TICKET_PATTERNS = _re.compile(
     r"ticket\s*(number|#|no\.?)?\s*\d+|check\s*(my\s*)?(ticket|complaint)|"
     r"status\s*of\s*(my\s*)?(ticket|complaint)|complaint\s*(history|status)",
     _re.IGNORECASE,
 )
+
 _CUSTOMER_ID_PATTERN = _re.compile(
     r"customer\s*(id\s*)?[:\s]*(CUST-\d+)", _re.IGNORECASE
 )
+
 _TICKET_ID_PATTERN = _re.compile(
     r"ticket\s*(number|#|no\.?)?\s*(\d+)", _re.IGNORECASE
 )
@@ -77,19 +66,20 @@ def _needs_complaint_check(message: str) -> tuple[bool, str]:
     match = _TICKET_PATTERNS.search(message)
     if not match:
         return False, ""
+
     cust_match   = _CUSTOMER_ID_PATTERN.search(message)
     ticket_match = _TICKET_ID_PATTERN.search(message)
     customer_id  = cust_match.group(2)   if cust_match   else "CUST-001"
     ticket_id    = ticket_match.group(2) if ticket_match else None
+
     task = (
         f"Check the status of ticket #{ticket_id} for customer {customer_id}."
         if ticket_id
         else f"Retrieve complaint history for customer {customer_id}."
     )
+
     return True, task
 
-
-# ── System prompts ────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a friendly, knowledgeable, and enthusiastic sales agent for a telecommunications company.
 
@@ -115,21 +105,22 @@ INTERNAL_PROMPT = """You are the sales agent responding to an internal request f
 Return concise, factual product data. Do NOT greet. Just return the relevant information."""
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _get_last_human_text(messages: list) -> str:
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             content = msg.content
             return content if isinstance(content, str) else str(content)
+
     return ""
 
 
 def _build_messages(req: A2ARequest) -> list:
     system_prompt = INTERNAL_PROMPT if req.is_internal else USER_FACING_PROMPT
+
     prior         = dicts_to_messages(req.conversation_history)
     if not prior or not isinstance(prior[-1], HumanMessage):
         prior.append(HumanMessage(content=req.user_message))
+
     return [SystemMessage(content=system_prompt), *prior]
 
 
@@ -143,45 +134,36 @@ def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
             calling_agent=AgentType.SALES.value,
             history=req.conversation_history,
         )
+
         bound_billing = bind_inter_agent_args(
             _call_billing_agent_tool,
             session_id=session_id,
             calling_agent=AgentType.SALES.value,
             history=req.conversation_history,
         )
+
         tools = [*mcp_tools, bound_complaint, bound_billing]
 
-    # Guard: only include objects that have a .name attribute
     return {t.name: t for t in tools if hasattr(t, "name") and t.name}
 
 
-# ── Streaming generator ───────────────────────────────────────────────────────
-
 async def stream_sales_agent(req: A2ARequest) -> AsyncIterator[str]:
     session_id = req.context.get("session_id", req.request_id)
-
-    trace_emitter.emit(session_id, "agent_start", agent="sales",
-                       is_internal=req.is_internal,
-                       triggered_by=req.calling_agent or "orchestrator")
-
+    trace_emitter.emit(session_id, "agent_start", agent="sales",is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
     messages = _build_messages(req)
     tool_map = _build_tool_map(req, session_id)
 
-    # Pre-flight: inject complaint result before LLM runs
     if not req.is_internal:
         last_human = _get_last_human_text(messages)
+
         needs_check, task = _needs_complaint_check(last_human)
         if needs_check:
             bound_complaint = tool_map.get("call_complaint_agent")
             if bound_complaint:
-                trace_emitter.emit(session_id, "agent_handoff",
-                                   from_agent="sales", to_agent="complaint",
-                                   reason=task)
+                trace_emitter.emit(session_id, "agent_handoff", from_agent="sales", to_agent="complaint", reason=task)
                 complaint_result = bound_complaint.invoke({"task": task})
-                messages.insert(-1, HumanMessage(
-                    content=f"[Complaint agent result]: {complaint_result}"
-                ))
-                # Remove from tool_map so LLM can't call it again
+                messages.insert(-1, HumanMessage(content=f"[Complaint agent result]: {complaint_result}" ))
+
                 tool_map = {k: v for k, v in tool_map.items()
                             if k != "call_complaint_agent"}
 
@@ -198,24 +180,22 @@ async def stream_sales_agent(req: A2ARequest) -> AsyncIterator[str]:
         yield chunk
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mcp_tools
     mcp_url = f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse"
     print(f"Connecting to Sales MCP server at {mcp_url} ...")
+
     try:
         mcp_tools = await mcp_client.get_tools()
+
     except Exception as e:
-        raise RuntimeError(
-            f"Sales MCP server not reachable at {mcp_url}."
-        ) from e
+        raise RuntimeError( f"Sales MCP server not reachable at {mcp_url}."  ) from e
+
     print(f"Loaded {len(mcp_tools)} MCP tools: {[t.name for t in mcp_tools]}")
+
     yield
 
-
-# ── FastAPI ───────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Sales Agent", version="4.0", lifespan=lifespan)
 
@@ -225,8 +205,9 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
     if not mcp_tools:
         async def not_ready():
             yield f"event: error\ndata: {json.dumps({'message': 'Sales agent not ready.'})}\n\n"
-        return StreamingResponse(not_ready(), media_type="text/event-stream",
-                                 headers={"X-Accel-Buffering": "no"})
+
+        return StreamingResponse(not_ready(), media_type="text/event-stream",headers={"X-Accel-Buffering": "no"})
+
     return StreamingResponse(
         stream_sales_agent(req),
         media_type="text/event-stream",
@@ -237,16 +218,14 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
     if not mcp_tools:
-        return A2AResponse(request_id=req.request_id, source_agent=AgentType.SALES,
-                           status="error", result="Sales agent not ready.")
+        return A2AResponse(request_id=req.request_id, source_agent=AgentType.SALES,status="error", result="Sales agent not ready.")
 
     session_id = req.context.get("session_id", req.request_id)
 
-    trace_emitter.emit(session_id, "agent_start", agent="sales",
-                       is_internal=req.is_internal,
-                       triggered_by=req.calling_agent or "orchestrator")
+    trace_emitter.emit(session_id, "agent_start", agent="sales", is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
 
     final_text = ""
+
     async for raw in stream_sales_agent(req):
         for line in raw.splitlines():
             line = line.strip()
