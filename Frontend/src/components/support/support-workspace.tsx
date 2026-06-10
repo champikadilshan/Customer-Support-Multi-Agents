@@ -22,6 +22,8 @@ export function SupportWorkspace() {
           <RightSidebar
             graph={chat.agentGraph}
             isGraphLive={chat.isGraphLive}
+            sessionId={chat.sessionId}
+            onReplayTrace={chat.replayTrace}
           />
         </aside>
 

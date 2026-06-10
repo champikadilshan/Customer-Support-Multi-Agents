@@ -16,31 +16,46 @@ export type StaticEdge = {
   kind: "route" | "pipeline" | "collaboration" | "data"
 }
 
+/**
+ * Four-column layout with explicit gaps so infra nodes never overlap.
+ * Columns: Billing | Complaint+Ticket | HITL | Sales+MCP
+ */
 export const CANVAS = {
-  width: 1440,
-  height: 396,
+  width: 1040,
+  height: 400,
 }
 
-/**
- * Three-tier layout with separated infra columns:
- * - Complaint stack: Ticket API → Ticket DB (vertical)
- * - Sales stack: Sales MCP → Product Graph (vertical)
- */
+const COL = {
+  billing: 0,
+  complaint: 270,
+  hitl: 540,
+  sales: 810,
+} as const
+
+const NODE_W = 210
+const NODE_H_AGENT = 86
+const NODE_H_INFRA = 78
+
 export const NODE_LAYOUT: Record<AgentNodeId, NodeLayout> = {
-  intent_detector: { x: 540, y: 8, w: 220, h: 68 },
+  intent_detector: {
+    x: (CANVAS.width - 230) / 2,
+    y: 0,
+    w: 230,
+    h: 82,
+  },
 
-  billing: { x: 40, y: 108, w: 220, h: 72 },
-  complaint: { x: 540, y: 108, w: 220, h: 72 },
-  sales: { x: 1040, y: 108, w: 220, h: 72 },
+  billing: { x: COL.billing, y: 100, w: NODE_W, h: NODE_H_AGENT },
+  complaint: { x: COL.complaint, y: 100, w: NODE_W, h: NODE_H_AGENT },
+  sales: { x: COL.sales, y: 100, w: NODE_W, h: NODE_H_AGENT },
 
-  billing_db: { x: 40, y: 228, w: 220, h: 64 },
+  billing_db: { x: COL.billing, y: 218, w: NODE_W, h: NODE_H_INFRA },
 
-  ticket_api: { x: 360, y: 228, w: 200, h: 64 },
-  hitl: { x: 640, y: 228, w: 200, h: 64 },
-  ticket_db: { x: 360, y: 314, w: 200, h: 64 },
+  ticket_api: { x: COL.complaint, y: 218, w: NODE_W, h: NODE_H_INFRA },
+  hitl: { x: COL.hitl, y: 218, w: NODE_W, h: NODE_H_INFRA },
+  ticket_db: { x: COL.complaint, y: 312, w: NODE_W, h: NODE_H_INFRA },
 
-  sales_mcp: { x: 1040, y: 228, w: 220, h: 64 },
-  product_db: { x: 1040, y: 314, w: 220, h: 64 },
+  sales_mcp: { x: COL.sales, y: 218, w: NODE_W, h: NODE_H_INFRA },
+  product_db: { x: COL.sales, y: 312, w: NODE_W, h: NODE_H_INFRA },
 }
 
 export const STATIC_EDGES: StaticEdge[] = [
@@ -152,9 +167,11 @@ export const STATIC_EDGES: StaticEdge[] = [
 
 export function mapHandoffToNodeId(agent: string): AgentNodeId | null {
   const normalized = agent.toLowerCase()
+  if (normalized === "orchestrator" || normalized.includes("intent")) {
+    return "intent_detector"
+  }
   if (normalized.includes("billing")) return "billing"
   if (normalized.includes("complaint")) return "complaint"
   if (normalized.includes("sales")) return "sales"
-  if (normalized.includes("intent")) return "intent_detector"
   return null
 }

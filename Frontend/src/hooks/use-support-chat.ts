@@ -26,7 +26,7 @@ export function useSupportChat() {
   const [activeAgent, setActiveAgent] = useState<string | null>(null)
   const [activeIntent, setActiveIntent] = useState<string | null>(null)
   const [sessionId, setSessionId] = useState<string | null>(readStoredSessionId)
-  const { agentGraph, resetGraph, connectTrace } = useAgentTrace(sessionId)
+  const { agentGraph, resetGraph, connectTrace, replayTrace } = useAgentTrace(sessionId)
   const abortRef = useRef<AbortController | null>(null)
   const assistantIdRef = useRef<string | null>(null)
 
@@ -327,5 +327,7 @@ export function useSupportChat() {
     respondToHitl,
     agentGraph,
     isGraphLive,
+    sessionId,
+    replayTrace,
   }
 }

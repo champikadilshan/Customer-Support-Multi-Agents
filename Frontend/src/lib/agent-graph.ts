@@ -47,6 +47,11 @@ export type GraphActivity = {
   id: string
   message: string
   timestamp: number
+  eventType?: string
+  agent?: string
+  tool?: string
+  durationMs?: number
+  highlightNodeId?: AgentNodeId
 }
 
 export type AgentGraphState = {
@@ -78,8 +83,8 @@ export const AGENT_NODES: Record<
   { label: string; description: string; subtitle?: string }
 > = {
   intent_detector: {
-    label: "Intent Detector",
-    description: "Orchestrator · routes by intent",
+    label: "Orchestrator",
+    description: "Routes requests to specialist agents",
     subtitle: ":8001",
   },
   billing: {
@@ -102,8 +107,8 @@ export const AGENT_NODES: Record<
     description: "Approval gate before ticket create",
   },
   billing_db: {
-    label: "Billing DB",
-    description: "SQLite · accounts & invoices",
+    label: "SQLite DB",
+    description: "Accounts & invoices",
   },
   sales_mcp: {
     label: "Sales MCP",
@@ -111,8 +116,8 @@ export const AGENT_NODES: Record<
     subtitle: ":8005",
   },
   product_db: {
-    label: "Product Graph",
-    description: "Neo4j catalog",
+    label: "Neo4j Graph DB",
+    description: "Product catalog",
   },
   ticket_api: {
     label: "Ticket Service",
@@ -177,11 +182,14 @@ function createActivityId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-export function pushActivity(state: AgentGraphState, message: string): AgentGraphState {
+export function pushActivity(
+  state: AgentGraphState,
+  activity: Omit<GraphActivity, "id">
+): AgentGraphState {
   const activities = [
-    { id: createActivityId(), message, timestamp: Date.now() },
     ...state.activities,
-  ].slice(0, 12)
+    { id: createActivityId(), ...activity },
+  ].slice(-50)
   return { ...state, activities }
 }
 

@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils"
 import { formatToolLabel } from "@/lib/agent-tools"
 import { AGENT_NODES, type AgentNodeId, type NodeStatus } from "@/lib/agent-graph"
 import type { AgentFlowNodeData } from "@/lib/agent-flow-elements"
+import type { HealthStatus } from "@/hooks/use-agent-health"
 
 const NODE_ICONS: Record<
   AgentNodeId,
@@ -32,6 +33,17 @@ const NODE_ICONS: Record<
   product_db: Database,
   ticket_api: Server,
   ticket_db: Database,
+}
+
+function healthDotClass(health?: HealthStatus) {
+  switch (health) {
+    case "healthy":
+      return "bg-emerald-500"
+    case "down":
+      return "bg-destructive"
+    default:
+      return "bg-muted-foreground/50"
+  }
 }
 
 function statusLabel(status: NodeStatus) {
@@ -85,7 +97,9 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
 
       <div
         className={cn(
-          "relative flex h-full min-w-0 flex-col overflow-hidden rounded-xl border bg-background px-2.5 py-2 shadow-sm transition-all duration-500",
+          "relative flex h-full min-w-0 flex-col overflow-hidden rounded-xl border bg-background px-3 py-2.5 shadow-sm transition-all duration-500",
+          data.highlighted &&
+            "ring-2 ring-sky-500/70 ring-offset-1 ring-offset-background",
           isInfra && "rounded-lg bg-muted/30",
           data.status === "active" &&
             (isInfra
@@ -110,11 +124,21 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
           />
         ) : null}
 
-        <div className="flex min-h-0 min-w-0 flex-1 items-start gap-2">
+        {data.health ? (
+          <span
+            className={cn(
+              "absolute right-2.5 top-2.5 h-2.5 w-2.5 rounded-full",
+              healthDotClass(data.health)
+            )}
+            title={data.health === "healthy" ? "Healthy" : data.health === "down" ? "Down" : "Unknown"}
+          />
+        ) : null}
+
+        <div className="flex min-h-0 min-w-0 flex-1 items-start gap-2.5">
           <div
             className={cn(
               "flex shrink-0 items-center justify-center rounded-md border",
-              isInfra ? "h-6 w-6" : "h-7 w-7",
+              isInfra ? "h-8 w-8" : "h-9 w-9",
               isActive
                 ? isInfra
                   ? "border-emerald-600/25 bg-emerald-600 text-white dark:border-emerald-400/25 dark:bg-emerald-500"
@@ -122,22 +146,22 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
                 : "border-border bg-muted/50 text-muted-foreground"
             )}
           >
-            <Icon className={cn(isInfra ? "h-3 w-3" : "h-3.5 w-3.5")} />
+            <Icon className={cn(isInfra ? "h-4 w-4" : "h-5 w-5")} />
           </div>
 
           <div className="min-w-0 flex-1 overflow-hidden">
             <div className="flex min-w-0 items-start justify-between gap-1">
               <p
                 className={cn(
-                  "min-w-0 truncate font-semibold leading-tight tracking-tight",
-                  isInfra ? "text-[10px]" : "text-[11px]"
+                  "min-w-0 font-semibold leading-tight tracking-tight",
+                  isInfra ? "text-xs" : "text-sm"
                 )}
               >
                 {meta.label}
               </p>
               <span
                 className={cn(
-                  "shrink-0 rounded-full px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-wide",
+                  "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide",
                   data.status === "active" &&
                     (isInfra
                       ? "bg-emerald-600 text-white dark:bg-emerald-500"
@@ -152,7 +176,7 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
                 {statusLabel(data.status)}
               </span>
             </div>
-            <p className="mt-0.5 line-clamp-2 overflow-hidden break-words text-[9px] leading-snug text-muted-foreground">
+            <p className="mt-1 line-clamp-2 overflow-hidden break-words text-[11px] leading-snug text-muted-foreground">
               {detailText}
               {meta.subtitle ? (
                 <span className="font-mono text-muted-foreground/70">

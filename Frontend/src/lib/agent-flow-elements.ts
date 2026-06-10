@@ -9,6 +9,7 @@ import {
   type EdgeStatus,
   type NodeStatus,
 } from "@/lib/agent-graph"
+import type { HealthStatus } from "@/hooks/use-agent-health"
 import {
   mapHandoffToNodeId,
   NODE_LAYOUT,
@@ -22,6 +23,8 @@ export type AgentFlowNodeData = {
   detail?: string
   runningTool?: string
   dimmed: boolean
+  highlighted: boolean
+  health?: HealthStatus
   kind: "orchestrator" | "agent" | "infra"
 }
 
@@ -59,7 +62,13 @@ function isAgentDimmed(graph: AgentGraphState, nodeId: AgentNodeId) {
   )
 }
 
-export function buildFlowNodes(graph: AgentGraphState): Node<AgentFlowNodeData>[] {
+export function buildFlowNodes(
+  graph: AgentGraphState,
+  options?: {
+    highlightNodeId?: AgentNodeId | null
+    health?: Partial<Record<AgentNodeId, HealthStatus>>
+  }
+): Node<AgentFlowNodeData>[] {
   return AGENT_NODE_IDS.map((nodeId) => {
     const layout = NODE_LAYOUT[nodeId]
     const node = graph.nodes[nodeId]
@@ -74,6 +83,8 @@ export function buildFlowNodes(graph: AgentGraphState): Node<AgentFlowNodeData>[
         detail: node.detail,
         runningTool: node.runningTools.at(-1),
         dimmed: isAgentDimmed(graph, nodeId),
+        highlighted: options?.highlightNodeId === nodeId,
+        health: options?.health?.[nodeId],
         kind: NODE_KIND[nodeId],
       },
       style: {

@@ -1,15 +1,31 @@
 "use client"
 
-import { Bot } from "lucide-react"
+import { useEffect, useRef, useState } from "react"
+import { Bot, Play } from "lucide-react"
 
 import { cn } from "@/lib/utils"
-import { type AgentGraphState } from "@/lib/agent-graph"
+import { type AgentGraphState, type AgentNodeId } from "@/lib/agent-graph"
 import { AgentFlowCanvas } from "@/components/support/agent-flow-canvas"
+import { Button } from "@/components/ui/button"
 
 type AgentGraphPanelProps = {
   graph: AgentGraphState
   isLive: boolean
   hideHeader?: boolean
+  sessionId?: string | null
+  onReplay?: (sessionId: string) => Promise<void>
+}
+
+const BADGE_STYLES: Record<string, string> = {
+  orchestrator_dispatch: "bg-purple-500/15 text-purple-700 dark:text-purple-300",
+  agent_start: "bg-blue-500/15 text-blue-700 dark:text-blue-300",
+  agent_end: "bg-blue-500/15 text-blue-700 dark:text-blue-300",
+  agent_handoff: "bg-orange-500/15 text-orange-700 dark:text-orange-300",
+  tool_start: "bg-teal-500/15 text-teal-700 dark:text-teal-300",
+  tool_end: "bg-teal-500/15 text-teal-700 dark:text-teal-300",
+  hitl_requested: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  hitl_resumed: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  error: "bg-destructive/15 text-destructive",
 }
 
 function formatActivityTime(timestamp: number) {
@@ -56,14 +72,45 @@ function TraceStatusChip({
   )
 }
 
+function eventBadgeLabel(eventType?: string) {
+  if (!eventType) return "event"
+  return eventType.replace(/_/g, " ")
+}
+
 export function AgentGraphPanel({
   graph,
   isLive,
   hideHeader = false,
+  sessionId,
+  onReplay,
 }: AgentGraphPanelProps) {
+  const [highlightNodeId, setHighlightNodeId] = useState<AgentNodeId | null>(null)
+  const [isReplaying, setIsReplaying] = useState(false)
+  const logEndRef = useRef<HTMLDivElement>(null)
+
   const activeNodes = Object.values(graph.nodes).filter(
     (node) => node.status === "active" || node.status === "waiting"
   )
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [graph.activities.length])
+
+  const handleReplay = async () => {
+    if (!sessionId || !onReplay || isReplaying) return
+    setIsReplaying(true)
+    try {
+      await onReplay(sessionId)
+    } finally {
+      setIsReplaying(false)
+    }
+  }
+
+  const handleActivityClick = (nodeId?: AgentNodeId) => {
+    if (!nodeId) return
+    setHighlightNodeId(nodeId)
+    window.setTimeout(() => setHighlightNodeId(null), 1200)
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
@@ -93,39 +140,89 @@ export function AgentGraphPanel({
             <TraceStatusChip graph={graph} isLive={isLive} />
           ) : null}
         </div>
-        {graph.lastEventAt ? (
-          <span className="shrink-0 text-[11px] text-muted-foreground">
-            Updated {formatTraceTime(graph.lastEventAt)}
-          </span>
-        ) : null}
+        <div className="flex shrink-0 items-center gap-2">
+          {sessionId && onReplay ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 px-2 text-[11px]"
+              onClick={() => void handleReplay()}
+              disabled={isReplaying}
+            >
+              <Play className="h-3 w-3" />
+              {isReplaying ? "Replaying…" : "Replay"}
+            </Button>
+          ) : null}
+          {graph.lastEventAt ? (
+            <span className="text-[11px] text-muted-foreground">
+              Updated {formatTraceTime(graph.lastEventAt)}
+            </span>
+          ) : null}
+        </div>
       </div>
 
-      <AgentFlowCanvas graph={graph} className="min-h-[480px] flex-1" />
+      <div className="flex min-h-0 flex-1 flex-col gap-3">
+        <AgentFlowCanvas
+          graph={graph}
+          highlightNodeId={highlightNodeId}
+          className="min-h-[444px] flex-[3]"
+        />
 
-      <div className="mt-3 shrink-0 border-t pt-2">
-        <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-          Activity
-        </p>
-        <div className="scrollbar-hidden mt-1 h-[160px] overflow-y-auto">
-          {graph.activities.length > 0 ? (
-            <ul className="space-y-1.5">
-              {graph.activities.map((activity) => (
-                <li
-                  key={activity.id}
-                  className="rounded-md border border-border/60 bg-muted/30 px-2.5 py-1.5 text-sm"
-                >
-                  <p className="leading-snug text-foreground">{activity.message}</p>
-                  <p className="mt-0.5 text-[10px] text-muted-foreground">
-                    {formatActivityTime(activity.timestamp)}
-                  </p>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="text-xs leading-snug text-muted-foreground">
-              Trace events appear here as agents route, call tools, and hand off.
-            </p>
-          )}
+        <div className="flex min-h-0 shrink-0 flex-col rounded-xl border bg-background/70 flex-[2]">
+          <p className="shrink-0 border-b px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            Event log
+          </p>
+          <div className="scrollbar-hidden h-[136px] shrink-0 overflow-y-auto p-2">
+            {graph.activities.length > 0 ? (
+              <ul className="space-y-1.5">
+                {graph.activities.map((activity) => (
+                  <li key={activity.id}>
+                    <button
+                      type="button"
+                      onClick={() => handleActivityClick(activity.highlightNodeId)}
+                      className={cn(
+                        "w-full rounded-md border border-border/60 bg-muted/30 px-2.5 py-1.5 text-left text-sm transition-colors",
+                        activity.highlightNodeId &&
+                          "hover:border-foreground/25 hover:bg-muted/50"
+                      )}
+                    >
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono text-[10px] text-muted-foreground">
+                          {formatActivityTime(activity.timestamp)}
+                        </span>
+                        {activity.eventType ? (
+                          <span
+                            className={cn(
+                              "rounded px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide",
+                              BADGE_STYLES[activity.eventType] ??
+                                "bg-muted text-muted-foreground"
+                            )}
+                          >
+                            {eventBadgeLabel(activity.eventType)}
+                          </span>
+                        ) : null}
+                        <span className="text-xs text-foreground">
+                          {activity.agent ?? activity.tool ?? activity.message}
+                          {activity.durationMs != null
+                            ? ` · ${activity.durationMs}ms`
+                            : null}
+                        </span>
+                      </div>
+                      <p className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-muted-foreground">
+                        {activity.message}
+                      </p>
+                    </button>
+                  </li>
+                ))}
+                <div ref={logEndRef} />
+              </ul>
+            ) : (
+              <p className="px-1 text-xs leading-snug text-muted-foreground">
+                Trace events appear here as agents route, call tools, and hand off.
+              </p>
+            )}
+          </div>
         </div>
       </div>
     </div>

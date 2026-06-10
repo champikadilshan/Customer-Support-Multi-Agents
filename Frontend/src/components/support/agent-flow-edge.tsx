@@ -55,7 +55,7 @@ function TraceEdgeComponent({
         path={path}
         style={{
           stroke,
-          strokeWidth: isActive ? 2.25 : 1.5,
+          strokeWidth: isActive ? 3 : 2,
           strokeDasharray,
           strokeLinecap: "round",
           transition: "stroke 0.35s ease, stroke-width 0.35s ease, opacity 0.35s ease",
@@ -63,7 +63,7 @@ function TraceEdgeComponent({
       />
       {isActive ? (
         <circle r="4" fill={stroke}>
-          <animateMotion dur="1.25s" repeatCount="indefinite" path={path} />
+          <animateMotion dur="0.8s" repeatCount="1" path={path} />
         </circle>
       ) : null}
     </g>

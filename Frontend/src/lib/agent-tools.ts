@@ -8,6 +8,7 @@ export const TOOL_LABELS: Record<string, string> = {
   get_ticket_status: "Ticket Status",
   categorize_complaint: "Categorize Complaint",
   stage_ticket_creation: "Stage Ticket",
+  create_ticket: "Create Ticket",
   get_product_catalog: "Product Catalog",
   get_active_promotions: "Promotions",
   check_product_availability: "Availability",
@@ -29,6 +30,7 @@ export const AGENT_TOOL_IDS: Partial<Record<AgentNodeId, string[]>> = {
     "get_complaint_history",
     "get_ticket_status",
     "stage_ticket_creation",
+    "create_ticket",
     "call_billing_agent",
     "call_sales_agent",
   ],
@@ -96,6 +98,13 @@ export const TOOL_INFRA_ACTIVATION: Record<
   stage_ticket_creation: {
     nodes: ["hitl"],
     edges: [["complaint", "hitl"]],
+  },
+  create_ticket: {
+    nodes: ["ticket_api", "ticket_db"],
+    edges: [
+      ["complaint", "ticket_api"],
+      ["ticket_api", "ticket_db"],
+    ],
   },
 }
 

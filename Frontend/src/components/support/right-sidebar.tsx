@@ -17,9 +17,16 @@ import { refreshTicketsPanel } from "@/hooks/use-tickets"
 type RightSidebarProps = {
   graph: AgentGraphState
   isGraphLive: boolean
+  sessionId?: string | null
+  onReplayTrace?: (sessionId: string) => Promise<void>
 }
 
-export function RightSidebar({ graph, isGraphLive }: RightSidebarProps) {
+export function RightSidebar({
+  graph,
+  isGraphLive,
+  sessionId,
+  onReplayTrace,
+}: RightSidebarProps) {
   const [view, setView] = useState<SidebarView>("tickets")
   const [isRefreshing, setIsRefreshing] = useState(false)
 
@@ -67,7 +74,13 @@ export function RightSidebar({ graph, isGraphLive }: RightSidebarProps) {
         {view === "tickets" ? (
           <TicketsPanel embedded hideHeader />
         ) : (
-          <AgentGraphPanel graph={graph} isLive={isGraphLive} hideHeader />
+          <AgentGraphPanel
+            graph={graph}
+            isLive={isGraphLive}
+            hideHeader
+            sessionId={sessionId}
+            onReplay={onReplayTrace}
+          />
         )}
       </div>
     </div>

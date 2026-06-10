@@ -7,6 +7,7 @@ import {
   type AgentGraphState,
   type AgentNodeId,
   type EdgeStatus,
+  type GraphActivity,
 } from "@/lib/agent-graph"
 import {
   formatToolLabel,
@@ -23,8 +24,6 @@ export type TraceEventType =
   | "tool_end"
   | "hitl_requested"
   | "hitl_resumed"
-  | "handoff_executed"
-  | "pending_handoff_set"
   | "error"
 
 export type TraceEvent = {
@@ -33,8 +32,7 @@ export type TraceEvent = {
   ts: string
   agent?: string
   tool?: string
-  intent?: string
-  target_agent?: string
+  user_message?: string
   request_id?: string
   from_agent?: string
   to_agent?: string
@@ -45,14 +43,36 @@ export type TraceEvent = {
   is_internal?: boolean
   triggered_by?: string
   ticket_preview?: Record<string, unknown>
+  duration_ms?: number
 }
 
-function mapTraceAgent(agent: string | undefined): AgentNodeId | null {
+export function mapTraceAgent(agent: string | undefined): AgentNodeId | null {
   if (!agent) return null
   if (agent === "orchestrator" || agent === "intent_detector") {
     return "intent_detector"
   }
   return mapAgentValue(agent)
+}
+
+/** Nodes that should flash success then return to idle after a transient event. */
+export function getFlashResetTargets(event: TraceEvent): AgentNodeId[] {
+  const targets = new Set<AgentNodeId>()
+
+  if (event.type === "agent_end" && event.status === "success") {
+    const agentId = mapTraceAgent(event.agent)
+    if (agentId) targets.add(agentId)
+  }
+
+  if (event.type === "tool_end" && event.tool) {
+    const config = TOOL_INFRA_ACTIVATION[event.tool]
+    if (config) {
+      for (const nodeId of config.nodes) {
+        targets.add(nodeId)
+      }
+    }
+  }
+
+  return Array.from(targets)
 }
 
 function resetTurnState(state: AgentGraphState): AgentGraphState {
@@ -142,7 +162,8 @@ function activateToolInfra(state: AgentGraphState, tool: string): AgentGraphStat
   if (
     tool === "get_complaint_history" ||
     tool === "get_ticket_status" ||
-    tool === "stage_ticket_creation"
+    tool === "stage_ticket_creation" ||
+    tool === "create_ticket"
   ) {
     next = { ...next, showComplaintFlow: true }
   }
@@ -171,17 +192,12 @@ function completeToolInfra(state: AgentGraphState, tool: string): AgentGraphStat
   return next
 }
 
-function AGENT_LABEL(agent: string | undefined) {
-  if (!agent) return "agent"
-  return agent.charAt(0).toUpperCase() + agent.slice(1)
-}
-
 function activatePrimaryRoute(
   state: AgentGraphState,
   agentId: AgentNodeId,
   detail: string
 ): AgentGraphState {
-  let next = setNode(state, "intent_detector", "completed", "Intent routed")
+  let next = setNode(state, "intent_detector", "active", "Dispatching...")
   next = setNode(next, agentId, "active", detail)
   next = setEdge(next, "intent_detector", agentId, "active")
   next = {
@@ -199,13 +215,33 @@ function activatePrimaryRoute(
   return next
 }
 
+function resolveHighlightNode(event: TraceEvent): AgentNodeId | undefined {
+  const agentId = mapTraceAgent(event.agent)
+  if (agentId) return agentId
+
+  if (event.type === "orchestrator_dispatch") return "intent_detector"
+
+  if (event.type === "agent_handoff") {
+    return mapTraceAgent(event.to_agent) ?? undefined
+  }
+
+  if (event.tool) {
+    const config = TOOL_INFRA_ACTIVATION[event.tool]
+    if (config?.nodes[0]) return config.nodes[0]
+  }
+
+  return undefined
+}
+
 function formatActivityMessage(event: TraceEvent): string {
   switch (event.type) {
     case "orchestrator_dispatch":
-      return `Orchestrator dispatched to ${event.target_agent} (${event.intent})`
+      return event.user_message
+        ? `Orchestrator dispatch: ${event.user_message}`
+        : "Orchestrator dispatch"
     case "agent_start":
       return event.is_internal
-        ? `${event.agent} started (internal call from ${event.triggered_by})`
+        ? `${event.agent} started (internal from ${event.triggered_by})`
         : `${event.agent} agent started`
     case "agent_end":
       return `${event.agent} agent finished (${event.status ?? "success"})`
@@ -219,14 +255,22 @@ function formatActivityMessage(event: TraceEvent): string {
       return "Human approval requested before ticket creation"
     case "hitl_resumed":
       return `Human responded: ${event.response}`
-    case "handoff_executed":
-      return `Handoff executed: ${event.from_agent} → ${event.to_agent}`
-    case "pending_handoff_set":
-      return `Pending handoff queued: ${event.from_agent} → ${event.to_agent}`
     case "error":
       return event.message ?? "An error occurred"
     default:
       return "Trace event received"
+  }
+}
+
+function buildActivity(event: TraceEvent): Omit<GraphActivity, "id"> {
+  return {
+    message: formatActivityMessage(event),
+    timestamp: Date.parse(event.ts) || Date.now(),
+    eventType: event.type,
+    agent: event.agent ?? event.from_agent,
+    tool: event.tool,
+    durationMs: event.duration_ms,
+    highlightNodeId: resolveHighlightNode(event),
   }
 }
 
@@ -242,28 +286,9 @@ export function reduceAgentGraphOnTraceEvent(
 
   switch (event.type) {
     case "orchestrator_dispatch": {
-      const routed = mapAgentValue(event.target_agent)
       next = resetTurnState(next)
-      next = setNode(next, "intent_detector", "active", `Routing: ${event.intent}`)
-      if (routed) {
-        next = activatePrimaryRoute(next, routed, "Processing request...")
-      }
-      break
-    }
-
-    case "handoff_executed":
-    case "pending_handoff_set": {
-      const toAgent = mapTraceAgent(event.to_agent)
-      if (toAgent) {
-        next = activatePrimaryRoute(next, toAgent, event.reason ?? "Handoff in progress...")
-      }
-      next = upsertHandoff(
-        next,
-        event.from_agent ?? "unknown",
-        event.to_agent ?? "unknown",
-        "active",
-        event.reason
-      )
+      const preview = event.user_message?.slice(0, 80) ?? "Processing request..."
+      next = setNode(next, "intent_detector", "active", preview)
       break
     }
 
@@ -273,11 +298,6 @@ export function reduceAgentGraphOnTraceEvent(
 
       if (!event.is_internal) {
         if (next.routedAgent !== agentId) {
-          next = resetTurnState({
-            ...next,
-            traceConnected: true,
-            lastEventAt: next.lastEventAt,
-          })
           next = activatePrimaryRoute(next, agentId, "Handling request...")
         } else {
           next = setNode(next, agentId, "active", "Handling request...")
@@ -290,10 +310,16 @@ export function reduceAgentGraphOnTraceEvent(
             next,
             parentId,
             "active",
-            `Waiting on ${AGENT_LABEL(event.agent)}...`
+            `Waiting on ${event.agent ?? "agent"}...`
           )
+          next = setEdge(next, parentId, agentId, "active")
         }
-        next = setNode(next, agentId, "active", `Internal call from ${event.triggered_by}`)
+        next = setNode(
+          next,
+          agentId,
+          "active",
+          `Internal call from ${event.triggered_by ?? "agent"}`
+        )
         next = upsertHandoff(
           next,
           event.triggered_by ?? "unknown",
@@ -309,10 +335,22 @@ export function reduceAgentGraphOnTraceEvent(
       const agentId = mapTraceAgent(event.agent)
       if (!agentId) break
 
-      next = setNode(next, agentId, event.status === "success" ? "completed" : "error", "Done", {
-        runningTools: [],
-        completedTools: next.nodes[agentId].completedTools,
-      })
+      if (event.status === "hitl_suspended") {
+        next = setNode(next, agentId, "waiting", "Awaiting human input", {
+          runningTools: [],
+          completedTools: next.nodes[agentId].completedTools,
+        })
+      } else if (event.status === "success") {
+        next = setNode(next, agentId, "completed", "Done", {
+          runningTools: [],
+          completedTools: next.nodes[agentId].completedTools,
+        })
+      } else {
+        next = setNode(next, agentId, "error", event.message ?? "Failed", {
+          runningTools: [],
+          completedTools: next.nodes[agentId].completedTools,
+        })
+      }
 
       if (event.is_internal && event.triggered_by) {
         next = upsertHandoff(
@@ -321,6 +359,10 @@ export function reduceAgentGraphOnTraceEvent(
           event.agent ?? "unknown",
           "completed"
         )
+        const parentId = mapTraceAgent(event.triggered_by)
+        if (parentId) {
+          next = setEdge(next, parentId, agentId, "completed")
+        }
       }
 
       if (next.routedAgent === agentId && !event.is_internal) {
@@ -329,7 +371,10 @@ export function reduceAgentGraphOnTraceEvent(
       break
     }
 
-    case "agent_handoff":
+    case "agent_handoff": {
+      const fromId = mapTraceAgent(event.from_agent)
+      const toId = mapTraceAgent(event.to_agent)
+
       next = upsertHandoff(
         next,
         event.from_agent ?? "unknown",
@@ -337,13 +382,19 @@ export function reduceAgentGraphOnTraceEvent(
         "active",
         event.reason
       )
-      if (event.from_agent) {
-        const fromId = mapTraceAgent(event.from_agent)
+
+      if (fromId && toId) {
+        next = setEdge(next, fromId, toId, "active")
+        if (toId !== "intent_detector") {
+          next = setNode(next, toId, "active", event.reason ?? "Handoff in progress...")
+          next = { ...next, routedAgent: toId }
+        }
         if (fromId) {
           next = setNode(next, fromId, "active", `Handoff to ${event.to_agent}...`)
         }
       }
       break
+    }
 
     case "tool_start": {
       const agentId = mapTraceAgent(event.agent)
@@ -370,10 +421,8 @@ export function reduceAgentGraphOnTraceEvent(
     }
 
     case "hitl_requested":
-      next = {
-        ...next,
-        showComplaintFlow: true,
-      }
+      next = { ...next, showComplaintFlow: true }
+      next = setNode(next, "complaint", "waiting", "Awaiting approval")
       next = setNode(next, "hitl", "waiting", "Awaiting approval")
       next = setEdge(next, "complaint", "hitl", "active")
       break
@@ -383,6 +432,7 @@ export function reduceAgentGraphOnTraceEvent(
         event.response?.toLowerCase().includes("yes") ||
         event.response?.toLowerCase().includes("approve")
 
+      next = setNode(next, "complaint", "active", "Resuming after approval")
       next = setNode(next, "hitl", "completed", approved ? "Approved" : "Declined")
       next = setEdge(next, "complaint", "hitl", "completed")
 
@@ -391,8 +441,6 @@ export function reduceAgentGraphOnTraceEvent(
         next = setNode(next, "ticket_db", "active", "Persisting ticket...")
         next = setEdge(next, "hitl", "ticket_api", "active")
         next = setEdge(next, "ticket_api", "ticket_db", "active")
-      } else {
-        next = setNode(next, "complaint", "active", "Finalizing response...")
       }
       break
     }
@@ -404,7 +452,7 @@ export function reduceAgentGraphOnTraceEvent(
     }
   }
 
-  return pushActivity(next, formatActivityMessage(event))
+  return pushActivity(next, buildActivity(event))
 }
 
 export async function* parseTraceStream(
@@ -527,4 +575,18 @@ export async function connectAgentTrace(
       throw error
     }
   }
+}
+
+export async function fetchTraceReplay(sessionId: string): Promise<TraceEvent[]> {
+  const response = await fetch(
+    `/api/chat/trace/${encodeURIComponent(sessionId)}/replay`,
+    { cache: "no-store" }
+  )
+
+  if (!response.ok) {
+    throw new Error(`Trace replay failed with status ${response.status}`)
+  }
+
+  const payload = (await response.json()) as { events?: TraceEvent[] }
+  return payload.events ?? []
 }
