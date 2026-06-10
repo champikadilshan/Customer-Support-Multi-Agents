@@ -1,14 +1,3 @@
-"""
-complaint_agent/main.py  (v4 — agentic loop, no LangGraph)
-
-HITL without LangGraph checkpointer:
-  - When stage_ticket_creation is called, run_agent_loop yields hitl_request
-    and suspends (returns from generator).
-  - The hitl_request event carries pending_messages (full serialised message list).
-  - /process/stream stores pending_messages + ticket_data in session_store metadata.
-  - /process/resume reads them back, injects the user's yes/no, re-enters the loop.
-"""
-
 import json
 import httpx
 import sys
@@ -21,7 +10,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool as lc_tool
 from typing import AsyncIterator, Optional
 from pydantic import BaseModel
-
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import COMPLAINT_AGENT_PORT, AGENT_HOST, TICKET_SERVICE_PORT
 from shared.llm import get_vertex_llm
@@ -35,8 +23,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 TICKET_SERVICE_URL = f"http://{AGENT_HOST}:{TICKET_SERVICE_PORT}"
 
-
-# ── Own tools ─────────────────────────────────────────────────────────────────
 
 @lc_tool(
     "get_complaint_history",
@@ -54,8 +40,10 @@ def get_complaint_history(customer_id: str) -> list[dict]:
         if r.status_code != 200:
             return [{"error": f"Unexpected error (status {r.status_code})"}]
         return r.json()
+
     except httpx.ConnectError:
         return [{"error": "Ticket service unavailable."}]
+
     except httpx.TimeoutException:
         return [{"error": "Ticket service timed out."}]
 
@@ -76,8 +64,10 @@ def get_ticket_status(ticket_id: int) -> dict:
         if r.status_code != 200:
             return {"error": f"Unexpected error (status {r.status_code})"}
         return r.json()
+
     except httpx.ConnectError:
         return {"error": "Ticket service unavailable."}
+
     except httpx.TimeoutException:
         return {"error": "Ticket service timed out."}
 
@@ -130,9 +120,7 @@ def categorize_complaint(description: str) -> dict:
         "Always call categorize_complaint first to get category and priority."
     ),
 )
-def stage_ticket_creation(
-    title: str, description: str, customer_id: str, category: str, priority: str,
-) -> dict:
+def stage_ticket_creation( title: str, description: str, customer_id: str, category: str, priority: str,) -> dict:
     return {
         "staged": True, "title": title, "description": description,
         "customer_id": customer_id, "category": category, "priority": priority,
@@ -147,10 +135,7 @@ def stage_ticket_creation(
         "Use the exact details from the staged ticket."
     ),
 )
-def create_ticket(
-    title: str, description: str, customer_id: str,
-    category: str, priority: str,
-) -> dict:
+def create_ticket(title: str, description: str, customer_id: str, category: str, priority: str,) -> dict:
     try:
         r = httpx.post(
             f"{TICKET_SERVICE_URL}/tickets",
@@ -159,8 +144,10 @@ def create_ticket(
                   "priority": priority},
             timeout=10.0,
         )
+
         r.raise_for_status()
         ticket = r.json()
+
         return {
             "success":     True,
             "ticket_id":   ticket["id"],
@@ -169,6 +156,7 @@ def create_ticket(
             "category":    ticket.get("category"),
             "priority":    ticket.get("priority"),
         }
+
     except httpx.ConnectError:
         return {"error": "Ticket service unavailable."}
     except httpx.TimeoutException:
@@ -176,8 +164,6 @@ def create_ticket(
     except httpx.HTTPStatusError as e:
         return {"error": f"HTTP {e.response.status_code}"}
 
-
-# ── Inter-agent tools ─────────────────────────────────────────────────────────
 
 _call_billing_agent_tool = make_agent_call_tool(
     target=AgentType.BILLING,
@@ -197,16 +183,9 @@ _call_sales_agent_tool = make_agent_call_tool(
     ),
 )
 
-OWN_TOOLS = [
-    get_complaint_history, get_ticket_status,
-    categorize_complaint, stage_ticket_creation, create_ticket,
-]
-
-# ── LLM ───────────────────────────────────────────────────────────────────────
-
+OWN_TOOLS = [get_complaint_history, get_ticket_status, categorize_complaint, stage_ticket_creation, create_ticket,]
 llm = get_vertex_llm(temperature=0)
 
-# ── System prompts ────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a compassionate and professional complaint resolution agent for a telecommunications company.
 
@@ -238,13 +217,12 @@ Return concise, factual data. Do NOT greet. Do NOT trigger ticket staging.
 Only use get_complaint_history and get_ticket_status. Return the data directly."""
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _build_messages(req: A2ARequest) -> list:
     system_prompt = INTERNAL_PROMPT if req.is_internal else USER_FACING_PROMPT
     prior         = dicts_to_messages(req.conversation_history)
     if not prior or not isinstance(prior[-1], HumanMessage):
         prior.append(HumanMessage(content=req.user_message))
+
     return [SystemMessage(content=system_prompt), *prior]
 
 
@@ -265,21 +243,18 @@ def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
             history=req.conversation_history,
         )
         tools = [*OWN_TOOLS, bound_billing, bound_sales]
+
     return {t.name: t for t in tools if hasattr(t, "name") and t.name}
 
 class ResumeRequest(BaseModel):
     request_id:    str
-    hitl_response: str   # "yes" | "no"
+    hitl_response: str
 
-
-# ── Streaming generator — initial request ─────────────────────────────────────
 
 async def stream_complaint_agent(req: A2ARequest) -> AsyncIterator[str]:
     session_id = req.context.get("session_id", req.request_id)
 
-    trace_emitter.emit(session_id, "agent_start", agent="complaint",
-                       is_internal=req.is_internal,
-                       triggered_by=req.calling_agent or "orchestrator")
+    trace_emitter.emit(session_id, "agent_start", agent="complaint", is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
 
     messages = _build_messages(req)
     tool_map = _build_tool_map(req, session_id)
@@ -295,7 +270,6 @@ async def stream_complaint_agent(req: A2ARequest) -> AsyncIterator[str]:
         session_id=session_id,
         is_internal=req.is_internal,
     ):
-        # Intercept hitl_request event yielded by run_agent_loop
         lines = chunk.splitlines()
         is_hitl_chunk = any(
             l.strip().startswith("event:") and "hitl_request" in l
@@ -310,20 +284,17 @@ async def stream_complaint_agent(req: A2ARequest) -> AsyncIterator[str]:
                 try:
                     payload = json.loads(line[5:].strip())
                     if payload.get("ticket_preview") or payload.get("pending_messages") is not None:
+
                         session_store.get_or_create(session_id)
-                        session_store.set_metadata(session_id, "hitl_pending_request_id",
-                                                   req.request_id)
-                        session_store.set_metadata(session_id, "hitl_pending_messages",
-                                                   payload.get("pending_messages", []))
-                        session_store.set_metadata(session_id, "hitl_ticket_data",
-                                                   payload.get("ticket_preview", {}))
-                        trace_emitter.emit(session_id, "hitl_requested",
-                                           agent="complaint",
-                                           ticket_preview=payload.get("ticket_preview", {}))
-                        # Forward to client without pending_messages
+                        session_store.set_metadata(session_id, "hitl_pending_request_id", req.request_id)
+                        session_store.set_metadata(session_id, "hitl_pending_messages", payload.get("pending_messages", []))
+                        session_store.set_metadata(session_id, "hitl_ticket_data", payload.get("ticket_preview", {}))
+                        trace_emitter.emit(session_id, "hitl_requested", agent="complaint", ticket_preview=payload.get("ticket_preview", {}))
+
                         client_payload = {k: v for k, v in payload.items()
                                           if k != "pending_messages"}
                         yield f"event: hitl_request\ndata: {json.dumps(client_payload)}\n\n"
+
                         return
                 except (json.JSONDecodeError, KeyError):
                     pass
@@ -331,52 +302,39 @@ async def stream_complaint_agent(req: A2ARequest) -> AsyncIterator[str]:
             yield chunk
 
 
-# ── Streaming generator — resume after HITL ───────────────────────────────────
-
-async def stream_complaint_resume(
-    request_id: str, hitl_response: str, session_id: str
-) -> AsyncIterator[str]:
-    """
-    Resume a suspended complaint loop after the user has confirmed or declined.
-
-    1. Load pending messages from session metadata.
-    2. Inject an assistant acknowledgement + user response into messages.
-    3. Re-enter the loop — the LLM sees the confirmation and calls create_ticket
-       (if yes) or closes gracefully (if no).
-    """
+async def stream_complaint_resume( request_id: str, hitl_response: str, session_id: str) -> AsyncIterator[str]:
     pending_messages_dicts = session_store.get_metadata(session_id, "hitl_pending_messages")
     ticket_data            = session_store.get_metadata(session_id, "hitl_ticket_data") or {}
 
     if not pending_messages_dicts:
         yield f"event: error\ndata: {json.dumps({'message': 'No suspended session found.'})}\n\n"
+
         return
 
     trace_emitter.emit(session_id, "hitl_resumed",
                        agent="complaint", response=hitl_response)
 
-    # Reconstruct messages from stored state
     messages = dicts_to_messages(pending_messages_dicts)
 
-    # Inject the HITL confirmation as a new human message
     confirmed   = hitl_response.strip().lower() in ("yes", "y", "confirm", "ok", "sure")
+
     user_text   = (
         f"Yes, please create the ticket: {ticket_data.get('title', 'Support Ticket')}"
         if confirmed
         else "No, please don't raise the ticket."
     )
+
     messages.append(HumanMessage(content=user_text))
 
-    # Build tool map — same tools as user-facing complaint agent
-    # Use stored system prompt via a fresh request-like object
     tool_map = {
         t.name: t for t in [
             get_complaint_history, get_ticket_status,
             categorize_complaint, stage_ticket_creation, create_ticket,
         ]
     }
+
     llm_with_tools = llm.bind_tools(list(tool_map.values()))
 
-    # Re-enter the loop — LLM will call create_ticket or close gracefully
     async for chunk in run_agent_loop(
         llm_with_tools=llm_with_tools,
         messages=messages,
@@ -387,15 +345,12 @@ async def stream_complaint_resume(
     ):
         yield chunk
 
-    # Clear HITL metadata
     session_store.set_metadata(session_id, "hitl_pending_messages",  None)
     session_store.set_metadata(session_id, "hitl_ticket_data",       None)
     session_store.set_metadata(session_id, "hitl_pending_request_id", None)
 
     trace_emitter.emit(session_id, "agent_end", agent="complaint", status="success")
 
-
-# ── FastAPI ───────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Complaint Agent", version="4.0")
 
@@ -411,10 +366,8 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
 
 @app.post("/process/resume")
 async def process_resume(body: ResumeRequest) -> StreamingResponse:
-    # Find session_id from stored pending state
-    # We stored request_id → session mapping via session metadata
-    # Search all sessions for the matching pending request_id
     session_id = None
+
     for sid in session_store.all_session_ids():
         stored_rid = session_store.get_metadata(sid, "hitl_pending_request_id")
         if stored_rid == body.request_id:
@@ -424,8 +377,8 @@ async def process_resume(body: ResumeRequest) -> StreamingResponse:
     if not session_id:
         async def not_found():
             yield (f"event: error\ndata: {json.dumps({'message': 'No suspended session found '})}\n\n")
-        return StreamingResponse(not_found(), media_type="text/event-stream",
-                                 headers={"X-Accel-Buffering": "no"})
+
+        return StreamingResponse(not_found(), media_type="text/event-stream",headers={"X-Accel-Buffering": "no"})
 
     return StreamingResponse(
         stream_complaint_resume(body.request_id, body.hitl_response, session_id),
@@ -438,9 +391,7 @@ async def process_resume(body: ResumeRequest) -> StreamingResponse:
 async def process(req: A2ARequest) -> A2AResponse:
     session_id = req.context.get("session_id", req.request_id)
 
-    trace_emitter.emit(session_id, "agent_start", agent="complaint",
-                       is_internal=req.is_internal,
-                       triggered_by=req.calling_agent or "orchestrator")
+    trace_emitter.emit(session_id, "agent_start", agent="complaint", is_internal=req.is_internal,triggered_by=req.calling_agent or "orchestrator")
 
     messages       = _build_messages(req)
     tool_map       = _build_tool_map(req, session_id)
