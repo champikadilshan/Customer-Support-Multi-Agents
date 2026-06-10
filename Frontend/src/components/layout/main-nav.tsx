@@ -1,22 +1,32 @@
 "use client"
 
+import FitbitIcon from "@mui/icons-material/Fitbit"
 import { usePathname } from "next/navigation"
 
 import { cn } from "@/lib/utils"
 
 const NAV_ITEMS = ["Demo", "Billing", "Sales", "Complaints"] as const
 
+function AppLogo() {
+  return (
+    <div className="flex items-center gap-2">
+      <FitbitIcon sx={{ fontSize: 28, color: "hsl(var(--foreground))" }} />
+      <p className="hidden text-sm font-semibold tracking-tight sm:block">
+        Customer Support
+      </p>
+    </div>
+  )
+}
+
 export function MainNav() {
   const pathname = usePathname()
 
   return (
-    <div className="mr-4 hidden md:flex">
-      <div className="mr-4 flex items-center space-x-2 lg:mr-6">
-        <span className="hidden font-bold lg:inline-block">
-          virtusa-multi-agent
-        </span>
+    <div className="mr-4 flex md:flex">
+      <div className="mr-4 flex items-center lg:mr-6">
+        <AppLogo />
       </div>
-      <nav className="flex items-center gap-4 text-sm lg:gap-6">
+      <nav className="hidden items-center gap-4 text-sm md:flex lg:gap-6">
         {NAV_ITEMS.map((item) => {
           const isActive = item === "Demo" && pathname === "/"
 

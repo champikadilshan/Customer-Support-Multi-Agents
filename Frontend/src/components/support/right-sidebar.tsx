@@ -33,7 +33,7 @@ export function RightSidebar({ graph, isGraphLive }: RightSidebarProps) {
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <div className="mb-3 flex shrink-0 items-start justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="text-lg font-semibold tracking-tight">
+          <h2 className="text-2xl font-semibold tracking-tight">
             {view === "tickets" ? "Support Tickets" : "Agent Flow"}
           </h2>
           <p className="mt-1 text-sm font-light text-muted-foreground">

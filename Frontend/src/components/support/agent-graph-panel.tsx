@@ -71,7 +71,7 @@ export function AgentGraphPanel({
         <div className="shrink-0 pb-3">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <h2 className="text-lg font-semibold tracking-tight">Agent Flow</h2>
+              <h2 className="text-2xl font-semibold tracking-tight">Agent Flow</h2>
               <p className="mt-1 text-sm font-light text-muted-foreground">
                 Live node graph with real-time trace data flow
               </p>
@@ -106,7 +106,7 @@ export function AgentGraphPanel({
         <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
           Activity
         </p>
-        <div className="scrollbar-hidden mt-1 max-h-[160px] overflow-y-auto">
+        <div className="scrollbar-hidden mt-1 h-[160px] overflow-y-auto">
           {graph.activities.length > 0 ? (
             <ul className="space-y-1.5">
               {graph.activities.map((activity) => (
