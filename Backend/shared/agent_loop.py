@@ -93,10 +93,14 @@ async def _execute_tool(
         if fn is None:
             result = f"[Tool '{name}' not found]"
         else:
-            # Tools may be sync or async
-            if asyncio.iscoroutinefunction(getattr(fn, "func", fn)):
+            # Always try ainvoke first — MCP tools and many LangChain tools
+            # are async even when iscoroutinefunction returns False because
+            # they wrap their async implementation.
+            # Fall back to sync invoke in a thread only if ainvoke fails.
+            try:
                 result = await fn.ainvoke(args)
-            else:
+            except (AttributeError, NotImplementedError):
+                # Tool doesn't support ainvoke — run sync version in thread
                 result = await asyncio.to_thread(fn.invoke, args)
 
         # Serialise result to string
