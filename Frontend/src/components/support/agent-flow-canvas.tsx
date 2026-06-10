@@ -24,7 +24,7 @@ import { useAgentHealth } from "@/hooks/use-agent-health"
 const nodeTypes = { agentFlow: AgentFlowNode }
 const edgeTypes = { trace: TraceEdge }
 
-const FIT_VIEW_OPTIONS = { padding: 0.02, minZoom: 0.78, maxZoom: 1.75 }
+const FIT_VIEW_OPTIONS = { padding: 0.04, minZoom: 0.55, maxZoom: 1.75 }
 
 type AgentFlowCanvasProps = {
   graph: AgentGraphState
@@ -102,7 +102,7 @@ function AgentFlowGraph({
       zoomActivationKeyCode={null}
       preventScrolling
       proOptions={{ hideAttribution: true }}
-      className="agent-flow-canvas h-full w-full"
+      className="agent-flow-canvas relative h-full w-full"
     >
       <FitViewOnResize containerRef={containerRef} />
       <Controls
@@ -116,6 +116,17 @@ function AgentFlowGraph({
         size={1}
         color="hsl(var(--border))"
       />
+      <div className="pointer-events-none absolute bottom-3 left-3 z-10 rounded-lg border border-border/80 bg-background/95 px-3 py-2 text-[11px] text-muted-foreground shadow-sm backdrop-blur-sm">
+        <p className="mb-1 font-medium text-foreground">Edge legend</p>
+        <div className="flex items-center gap-2">
+          <span className="inline-block h-0 w-6 border-t-2 border-foreground" />
+          <span>Solid = Orchestrator dispatch / service call</span>
+        </div>
+        <div className="mt-1 flex items-center gap-2">
+          <span className="inline-block h-0 w-6 border-t-2 border-dashed border-muted-foreground/60" />
+          <span>Dashed = Internal A2A call between agents</span>
+        </div>
+      </div>
     </ReactFlow>
   )
 }

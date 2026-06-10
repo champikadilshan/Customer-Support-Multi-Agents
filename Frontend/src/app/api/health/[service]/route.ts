@@ -28,6 +28,10 @@ export async function GET(
     })
 
     if (!response.ok) {
+      // FastMCP on :8005 has no /health — 404 means the process is up but unprobed
+      if (service === "mcp" && response.status === 404) {
+        return Response.json({ status: "unknown", service: "sales_mcp" })
+      }
       return Response.json({ status: "down" }, { status: 200 })
     }
 

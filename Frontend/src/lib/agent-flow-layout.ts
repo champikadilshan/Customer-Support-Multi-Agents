@@ -13,30 +13,26 @@ export type StaticEdge = {
   to: AgentNodeId
   sourceHandle: string
   targetHandle: string
-  kind: "route" | "pipeline" | "collaboration" | "data"
+  kind: "route" | "collaboration" | "data"
 }
 
-/**
- * Four-column layout with explicit gaps so infra nodes never overlap.
- * Columns: Billing | Complaint+Ticket | HITL | Sales+MCP
- */
 export const CANVAS = {
-  width: 1040,
+  width: 1180,
   height: 492,
 }
 
+// 210px nodes + ~80–100px gutters so infra row (Ticket / HITL / Sales MCP) does not overlap
 const COL = {
   billing: 0,
-  complaint: 270,
-  hitl: 540,
-  sales: 810,
+  complaint: 310,
+  hitl: 640,
+  sales: 970,
 } as const
 
 const NODE_W = 210
 const NODE_H_AGENT = 86
 const NODE_H_INFRA = 78
 
-/** Shared vertical gap between graph tiers (orchestrator → agents → infra). */
 const ROW_GAP = 56
 const ORCHESTRATOR_H = 82
 const AGENT_ROW_Y = ORCHESTRATOR_H + ROW_GAP
@@ -57,8 +53,9 @@ export const NODE_LAYOUT: Record<AgentNodeId, NodeLayout> = {
 
   billing_db: { x: COL.billing, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
 
-  ticket_api: { x: COL.complaint, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
   hitl: { x: COL.hitl, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
+
+  ticket_api: { x: COL.complaint, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
   ticket_db: { x: COL.complaint, y: DEEP_INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
 
   sales_mcp: { x: COL.sales, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
@@ -99,19 +96,11 @@ export const STATIC_EDGES: StaticEdge[] = [
     kind: "data",
   },
   {
-    id: "data-sales-mcp",
-    from: "sales",
-    to: "sales_mcp",
-    sourceHandle: "bottom",
-    targetHandle: "top",
-    kind: "data",
-  },
-  {
-    id: "data-mcp-neo4j",
-    from: "sales_mcp",
-    to: "product_db",
-    sourceHandle: "bottom",
-    targetHandle: "top",
+    id: "pipe-complaint-hitl",
+    from: "complaint",
+    to: "hitl",
+    sourceHandle: "right",
+    targetHandle: "left",
     kind: "data",
   },
   {
@@ -131,20 +120,69 @@ export const STATIC_EDGES: StaticEdge[] = [
     kind: "data",
   },
   {
-    id: "pipe-complaint-hitl",
-    from: "complaint",
-    to: "hitl",
+    id: "data-sales-mcp",
+    from: "sales",
+    to: "sales_mcp",
     sourceHandle: "bottom",
     targetHandle: "top",
-    kind: "pipeline",
+    kind: "data",
   },
   {
-    id: "pipe-hitl-api",
-    from: "hitl",
-    to: "ticket_api",
+    id: "data-mcp-neo4j",
+    from: "sales_mcp",
+    to: "product_db",
+    sourceHandle: "bottom",
+    targetHandle: "top",
+    kind: "data",
+  },
+  // Internal A2A — bidirectional dashed pairs
+  {
+    id: "collab-b-to-c",
+    from: "billing",
+    to: "complaint",
+    sourceHandle: "right",
+    targetHandle: "left",
+    kind: "collaboration",
+  },
+  {
+    id: "collab-c-to-b",
+    from: "complaint",
+    to: "billing",
     sourceHandle: "source-left",
     targetHandle: "target-right",
-    kind: "pipeline",
+    kind: "collaboration",
+  },
+  {
+    id: "collab-c-to-s",
+    from: "complaint",
+    to: "sales",
+    sourceHandle: "right",
+    targetHandle: "left",
+    kind: "collaboration",
+  },
+  {
+    id: "collab-s-to-c",
+    from: "sales",
+    to: "complaint",
+    sourceHandle: "source-left",
+    targetHandle: "target-right",
+    kind: "collaboration",
+  },
+  {
+    id: "collab-s-to-b",
+    from: "sales",
+    to: "billing",
+    sourceHandle: "source-left",
+    targetHandle: "target-right",
+    kind: "collaboration",
+  },
+  {
+    id: "collab-b-to-s",
+    from: "billing",
+    to: "sales",
+    sourceHandle: "right",
+    targetHandle: "left",
+    kind: "collaboration",
   },
 ]
 

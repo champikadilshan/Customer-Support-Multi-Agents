@@ -118,3 +118,9 @@ export function formatToolLabel(toolId: string) {
 export function isInterAgentTool(toolId: string) {
   return toolId.startsWith("call_") && toolId.endsWith("_agent")
 }
+
+export const INTER_AGENT_TOOL_TARGETS: Record<string, AgentNodeId> = {
+  call_billing_agent: "billing",
+  call_complaint_agent: "complaint",
+  call_sales_agent: "sales",
+}

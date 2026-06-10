@@ -22,8 +22,9 @@ const HEALTH_TARGETS: { nodeId: AgentNodeId; url: string }[] = [
 async function checkHealth(url: string): Promise<HealthStatus> {
   try {
     const response = await fetch(url, { cache: "no-store" })
-    if (!response.ok) return "down"
     const payload = (await response.json()) as { status?: string }
+    if (payload.status === "unknown") return "unknown"
+    if (!response.ok) return "down"
     return payload.status === "ok" ? "healthy" : "down"
   } catch {
     return "down"
