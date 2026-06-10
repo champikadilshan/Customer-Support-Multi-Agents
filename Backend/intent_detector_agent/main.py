@@ -1,431 +1,327 @@
+"""
+intent_detector/main.py  (v4 — agentic loop orchestrator, no LangGraph)
+
+The orchestrator is now a meta-agent that uses the ReAct agentic loop.
+Its tools are the three specialist agents (billing, complaint, sales) plus
+todo planning tools. The LLM decides which agent to call, when, and in
+what order — no hardcoded intent detection, no sticky routing, no keyword
+matching.
+
+The LLM reads the full conversation history and decides routing naturally
+because it has all the context it needs.
+
+Session management endpoints are unchanged.
+Trace endpoints are unchanged.
+"""
+
 import uuid
 import json
 import httpx
+import asyncio
 import sys
 import os
 import uvicorn
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from langgraph.graph import StateGraph, END
-from langgraph.graph.state import CompiledStateGraph
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.tools import tool as lc_tool
 from pydantic import BaseModel
-from typing import TypedDict, Literal, AsyncIterator, Optional
+from typing import AsyncIterator, Optional
+
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import AGENT_URLS, INTENT_DETECTOR_PORT
 from shared.llm import get_vertex_llm
 from shared.session_store import session_store
 from shared.message_utils import messages_to_dicts, dicts_to_messages
 from shared.trace_emitter import trace_emitter
+from shared.agent_loop import run_agent_loop, _sse, _extract_text
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-VALID_INTENTS = {"billing", "complaint", "sales"}
 
-AGENT_TYPE_MAP: dict[str, AgentType] = {
-    "billing":   AgentType.BILLING,
-    "complaint": AgentType.COMPLAINT,
-    "sales":     AgentType.SALES,
-}
-
-
-class OrchestratorState(TypedDict):
-    user_message:         str
-    conversation_history: list[dict]   # serialised prior messages for context
-    detected_intent:      str
-    target_agent:         AgentType
-    a2a_response:         str
-    request_id:           str
-    final_response:       str
+# ── LLM ───────────────────────────────────────────────────────────────────────
 
 llm = get_vertex_llm(temperature=0)
 
+
+# ── Request schemas ───────────────────────────────────────────────────────────
+
 class ChatRequest(BaseModel):
     message:    str
-    session_id: Optional[str] = None   # client sends this on follow-up turns
+    session_id: Optional[str] = None
 
 class SessionResetRequest(BaseModel):
     session_id: str
 
-def _history_text(history: list[dict]) -> str:
-    lines = []
 
-    for msg in history:
-        t = msg.get("type", "")
-        c = msg.get("content", "")
-        if t == "human" and c:
-            lines.append(f"User: {c}")
-        elif t == "ai" and c:
-            lines.append(f"Agent: {c}")
+# ── Orchestrator system prompt ────────────────────────────────────────────────
 
-    return "\n".join(lines)
+ORCHESTRATOR_PROMPT = """You are the orchestration agent for a telecommunications customer support system.
+You coordinate three specialist agents to resolve customer requests:
+
+  - dispatch_billing_agent   : handles invoices, charges, account balance, payment methods
+  - dispatch_complaint_agent : handles complaints, ticket creation, ticket status, refunds
+  - dispatch_sales_agent     : handles product info, plans, pricing, promotions, upgrades
+
+Your workflow for every user message:
+1. Read the user message and conversation history carefully.
+2. Decide which specialist agent(s) can best handle this request.
+3. Dispatch to the relevant agent(s) using the dispatch tools.
+   - If the request spans multiple domains (e.g. "check my bill AND I want to complain"),
+     dispatch to billing first, then complaint with the billing result as context.
+   - If the request is purely one domain, dispatch to that agent only.
+4. Synthesise the agent response(s) into a single coherent reply to the user.
+
+Rules:
+- NEVER fabricate information. Only use what the agents return.
+- Pass the full conversation context in each dispatch so agents have history.
+- If an agent returns an error, report it honestly and suggest the user try again.
+- Keep responses conversational and focused on what the user actually asked.
+- Do NOT explain that you are coordinating agents — present one unified experience.
+- Use the customer's name if they provided it. Use account_id / customer_id if mentioned."""
 
 
-def _sse(event: str, data: dict) -> str:
+# ── Dispatch tools ────────────────────────────────────────────────────────────
+
+def _make_dispatch_tool(
+    agent_type: AgentType,
+    tool_name:  str,
+    description: str,
+):
+    """
+    Factory that creates a dispatch tool for a given specialist agent.
+    The tool calls the agent's /process/stream endpoint, collects tokens,
+    and returns the full response as a string.
+    """
+    agent_url = AGENT_URLS[agent_type]
+    stream_url = agent_url.replace("/process", "/process/stream")
+
+    @lc_tool(tool_name, description=description)
+    def _dispatch(
+        task:                str,
+        session_id:          str = "",
+        conversation_history: str = "[]",
+    ) -> str:
+        """Dispatch to specialist agent and return its response."""
+        try:
+            history = json.loads(conversation_history)
+        except (json.JSONDecodeError, TypeError):
+            history = []
+
+        request_id = str(uuid.uuid4())
+
+        req = A2ARequest(
+            request_id=request_id,
+            source_agent=AgentType.INTENT_DETECTOR,
+            target_agent=agent_type,
+            user_message=task,
+            context={"session_id": session_id},
+            conversation_history=history,
+        )
+
+        # Emit handoff trace
+        trace_emitter.emit(session_id, "agent_handoff",
+                           from_agent="orchestrator",
+                           to_agent=agent_type.value,
+                           reason=task[:120])
+
+        collected: list[str] = []
+        hitl_data: dict      = {}
+
+        try:
+            import httpx as _httpx
+            with _httpx.stream(
+                "POST", stream_url,
+                json=req.model_dump(),
+                timeout=60.0,
+            ) as response:
+                response.raise_for_status()
+                for raw_line in response.iter_lines():
+                    if not raw_line.startswith("data:"):
+                        continue
+                    try:
+                        payload = json.loads(raw_line[5:].strip())
+                        if payload.get("text"):
+                            collected.append(payload["text"])
+                        if payload.get("ticket_preview"):
+                            hitl_data = payload
+                    except json.JSONDecodeError:
+                        pass
+
+        except Exception as exc:
+            return f"[{agent_type.value} agent error: {exc}]"
+
+        if hitl_data:
+            # Store the request_id in the orchestrator's session store
+            # so /session/{sid} exposes it and the client can call /process/resume
+            if session_id:
+                session_store.set_metadata(session_id, "hitl_pending_request_id", request_id)
+                session_store.set_metadata(session_id, "hitl_agent_port",
+                                           str(agent_url).rstrip("/"))
+
+            return json.dumps({
+                "hitl_pending":   True,
+                "request_id":     request_id,
+                "question":       hitl_data.get("question", ""),
+                "ticket_preview": hitl_data.get("ticket_preview", {}),
+                "options":        hitl_data.get("options", ["Yes", "No"]),
+            })
+
+        return "".join(collected) or f"[{agent_type.value} agent returned no response]"
+
+    return _dispatch
+
+
+dispatch_billing_agent = _make_dispatch_tool(
+    AgentType.BILLING,
+    "dispatch_billing_agent",
+    (
+        "Dispatch to the billing specialist agent. "
+        "Use for: account balance, invoice history, payment methods, overcharge checks, "
+        "billing anomalies. "
+        "Pass a clear task description. Include account_id if the user provided one. "
+        "Pass session_id and conversation_history for context."
+    ),
+)
+
+dispatch_complaint_agent = _make_dispatch_tool(
+    AgentType.COMPLAINT,
+    "dispatch_complaint_agent",
+    (
+        "Dispatch to the complaint specialist agent. "
+        "Use for: raising complaint tickets, checking ticket status, complaint history, "
+        "refund requests, service issues. "
+        "Pass a clear task description. Include customer_id if the user provided one. "
+        "Pass session_id and conversation_history for context."
+    ),
+)
+
+dispatch_sales_agent = _make_dispatch_tool(
+    AgentType.SALES,
+    "dispatch_sales_agent",
+    (
+        "Dispatch to the sales specialist agent. "
+        "Use for: product information, plan pricing, promotions, upgrades, availability checks. "
+        "Pass a clear task description. "
+        "Pass session_id and conversation_history for context."
+    ),
+)
+
+DISPATCH_TOOLS = [dispatch_billing_agent, dispatch_complaint_agent, dispatch_sales_agent]
+TOOL_MAP       = {t.name: t for t in DISPATCH_TOOLS}
+
+
+# ── Core chat logic ───────────────────────────────────────────────────────────
+
+def _build_history_injection(session_id: str) -> str:
+    """Serialise session history as JSON string for tool args."""
+    return json.dumps(session_store.get_messages(session_id))
+
+
+async def _run_orchestrator(
+    user_message: str,
+    session_id:   str,
+) -> AsyncIterator[str]:
+    """
+    Run the orchestrator agentic loop for one user turn.
+    Yields SSE strings.
+    """
+    history = session_store.get_messages(session_id)
+
+    # Build enriched tool map that injects session_id + history automatically
+    history_json   = json.dumps(history)
+    enriched_tools = []
+    for t in DISPATCH_TOOLS:
+        @lc_tool(t.name, description=t.description)
+        def _enriched(task: str, _t=t) -> str:
+            return _t.invoke({
+                "task":                 task,
+                "session_id":           session_id,
+                "conversation_history": history_json,
+            })
+        enriched_tools.append(_enriched)
+
+    enriched_tool_map = {t.name: t for t in enriched_tools}
+    llm_with_tools    = llm.bind_tools(enriched_tools)
+
+    # Build messages
+    prior = dicts_to_messages(history)
+    if not prior or not isinstance(prior[-1], HumanMessage):
+        prior.append(HumanMessage(content=user_message))
+
+    messages = [SystemMessage(content=ORCHESTRATOR_PROMPT), *prior]
+
+    trace_emitter.emit(session_id, "orchestrator_dispatch",
+                       user_message=user_message[:120])
+
+    async for chunk in run_agent_loop(
+        llm_with_tools=llm_with_tools,
+        messages=messages,
+        tool_map=enriched_tool_map,
+        agent_name="orchestrator",
+        session_id=session_id,
+        is_internal=False,
+    ):
+        yield chunk
+
+
+# ── SSE helpers ───────────────────────────────────────────────────────────────
+
+def _make_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-def detect_intent_node(state: OrchestratorState) -> OrchestratorState:
-    history_block = _history_text(state["conversation_history"])
-    history_section = ( f"\n\nConversation so far:\n{history_block}" if history_block else "" )
+# ── Streaming pipeline with session management ────────────────────────────────
 
-    prompt = f"""You are an intent classifier for a customer support system.
-Classify the following user message into EXACTLY one of these categories:
-- billing   (invoices, payments, charges, account balance)
-- complaint (issues, problems, bad experience, refund requests, raise a ticket)
-- sales     (product info, pricing, promotions, purchasing){history_section}
-
-Current user message: {state['user_message']}
-
-Reply with ONLY the single word label. Nothing else."""
-
-    intent = llm.invoke(prompt).content.strip().lower()
-
-    if intent not in VALID_INTENTS:
-        intent = "unknown"
-
-    return {
-        **state,
-        "detected_intent": intent,
-        "target_agent":    AGENT_TYPE_MAP.get(intent, AgentType.BILLING),
-        "request_id":      str(uuid.uuid4()),
-    }
-
-
-async def dispatch_to_agent_node(state: OrchestratorState) -> OrchestratorState:
-    req = A2ARequest(
-        request_id=state["request_id"],
-        source_agent=AgentType.INTENT_DETECTOR,
-        target_agent=state["target_agent"],
-        user_message=state["user_message"],
-        context={"detected_intent": state["detected_intent"]},
-        conversation_history=state["conversation_history"],
-    )
-
-    try:
-        async with httpx.AsyncClient() as client:
-            url = AGENT_URLS[state["target_agent"]]
-            response = await client.post(url, json=req.model_dump(), timeout=30.0)
-            response.raise_for_status()
-            a2a_resp = A2AResponse(**response.json())
-            return {**state, "a2a_response": a2a_resp.result}
-
-    except httpx.ConnectError:
-        agent_name = state["target_agent"].value
-        return {
-            **state,
-            "a2a_response": (
-                f"The {agent_name} agent is currently unavailable. "
-                "Please try again later."
-            ),
-        }
-
-    except httpx.TimeoutException:
-        agent_name = state["target_agent"].value
-        return {
-            **state,
-            "a2a_response": (
-                f"The {agent_name} agent took too long to respond. "
-                "Please try again."
-            ),
-        }
-
-    except httpx.HTTPStatusError as e:
-        agent_name = state["target_agent"].value
-        return {
-            **state,
-            "a2a_response": (
-                f"The {agent_name} agent returned an error "
-                f"(status {e.response.status_code}). Please try again."
-            ),
-        }
-
-
-def format_response_node(state: OrchestratorState) -> OrchestratorState:
-    agent_label = {
-        AgentType.BILLING:   "Billing Support",
-        AgentType.COMPLAINT: "Complaint Support",
-        AgentType.SALES:     "Sales Support",
-    }.get(state["target_agent"], "Support")
-
-    final = f"[{agent_label}]\n\n{state['a2a_response']}"
-
-    return {**state, "final_response": final}
-
-
-def unknown_intent_node(state: OrchestratorState) -> OrchestratorState:
-    return {
-        **state,
-        "final_response": (
-            "I'm sorry, I couldn't understand your request. "
-            "Please ask about billing, a complaint, or our products."
-        ),
-    }
-
-
-def route_intent(state: OrchestratorState) -> Literal["dispatch", "unknown_intent"]:
-    return "dispatch" if state["detected_intent"] in VALID_INTENTS else "unknown_intent"
-
-
-def build_orchestrator_graph() -> CompiledStateGraph:
-    graph = StateGraph(OrchestratorState)
-
-    graph.add_node("detect_intent",   detect_intent_node)
-    graph.add_node("dispatch",        dispatch_to_agent_node)
-    graph.add_node("format_response", format_response_node)
-    graph.add_node("unknown_intent",  unknown_intent_node)
-
-    graph.set_entry_point("detect_intent")
-
-    graph.add_conditional_edges(
-        "detect_intent",
-        route_intent,
-        {
-            "dispatch":       "dispatch",
-            "unknown_intent": "unknown_intent",
-        },
-    )
-
-    graph.add_edge("dispatch",        "format_response")
-    graph.add_edge("format_response", END)
-    graph.add_edge("unknown_intent",  END)
-
-    return graph.compile()
-
-
-_CONFIRMATION_STARTERS = { "yes", "no", "ok", "okay", "sure", "yep", "nope", "yeah", "nah", "confirm", "cancel", "please", "go ahead", "do it", "skip", "don't", "dont",}
-_SALES_KEYWORDS    = {"plan", "plans", "product", "fiber", "internet", "mobile", "tv", "bundle", "price", "pricing", "upgrade", "promotion", "deal", "offer", "buy", "purchase", "available"}
-_BILLING_KEYWORDS  = {"bill", "invoice", "charge", "payment", "balance", "pay", "owe", "statement", "account"}
-_COMPLAINT_KEYWORDS = {"ticket", "complaint", "issue", "problem", "outage", "refund", "broken", "not working", "check ticket",  "check complaint", "ticket number", "ticket status"}
-
-_DOMAIN_KEYWORDS: dict[AgentType, set] = {
-    AgentType.SALES:     _SALES_KEYWORDS,
-    AgentType.BILLING:   _BILLING_KEYWORDS,
-    AgentType.COMPLAINT: _COMPLAINT_KEYWORDS,
-}
-
-
-def _is_mixed_intent(message: str, active_agent: AgentType) -> bool:
-    words = set(message.lower().split())
-
-    primary_keywords   = _DOMAIN_KEYWORDS.get(active_agent, set())
-    has_primary        = bool(words & primary_keywords)
-
-    other_domains = [a for a in _DOMAIN_KEYWORDS if a != active_agent]
-    has_secondary  = any(bool(words & _DOMAIN_KEYWORDS[a]) for a in other_domains)
-
-    result = has_primary and has_secondary
-    print(f"[MIXED_INTENT] active={active_agent.value} has_primary={has_primary} "
-          f"has_secondary={has_secondary} result={result}")
-
-    return result
-
-
-def _is_confirmation(message: str) -> bool:
-    cleaned = message.lower().strip().rstrip(".,!?")
-    words   = cleaned.split()
-
-    if not words:
-        return False
-
-    if words[0] in _CONFIRMATION_STARTERS:
-        return True
-
-    if len(words) <= 4 and set(words) & _CONFIRMATION_STARTERS:
-        return True
-
-    return False
-
-
-async def _run_chat( user_message: str, session_id:   Optional[str],) -> tuple[dict, str]:
+async def stream_from_orchestrator(
+    user_message: str,
+    session_id:   Optional[str],
+) -> AsyncIterator[str]:
     sess = session_store.get_or_create(session_id)
     sid  = sess.session_id
 
-    history      = session_store.get_messages(sid)
-    active_agent = session_store.get_active_agent(sid)
-
-    pending_handoff = session_store.get_metadata(sid, "pending_handoff")
-
-    if pending_handoff and pending_handoff in AGENT_TYPE_MAP:
-        previous_agent = active_agent.value if active_agent else "unknown"
-        new_agent      = AGENT_TYPE_MAP[pending_handoff]
-        session_store.set_active_agent(sid, new_agent)
-        session_store.set_metadata(sid, "pending_handoff", None)
-        active_agent = new_agent
-        request_id   = str(uuid.uuid4())
-        intent       = pending_handoff
-        trace_emitter.emit(sid, "handoff_executed",
-                           from_agent=previous_agent,
-                           to_agent=pending_handoff,
-                           request_id=request_id,
-                           reason="pending_handoff consumed — routing forced to new agent")
-        session_store.append_messages(sid, [{"type": "human", "content": user_message}])
-        history = session_store.get_messages(sid)
-
-        return {"intent": intent, "agent": active_agent,
-                "request_id": request_id, "history": history}, sid
-
-    if active_agent and _is_confirmation(user_message):
-        intent     = active_agent.value
-        request_id = str(uuid.uuid4())
-
-    elif active_agent and _is_mixed_intent(user_message, active_agent):
-        intent     = active_agent.value
-        request_id = str(uuid.uuid4())
-        print(f"[ORCHESTRATOR] Mixed-intent detected — keeping sticky agent: {active_agent.value}")
-
-    else:
-        initial_state: OrchestratorState = {
-            "user_message":         user_message,
-            "conversation_history": history,
-            "detected_intent":      "",
-            "target_agent":         active_agent or AgentType.BILLING,
-            "a2a_response":         "",
-            "request_id":           "",
-            "final_response":       "",
-        }
-        intent_state = detect_intent_node(initial_state)
-        intent       = intent_state["detected_intent"]
-        request_id   = intent_state["request_id"]
-
-        if intent in VALID_INTENTS:
-            new_agent = AGENT_TYPE_MAP[intent]
-            if new_agent != active_agent:
-                session_store.set_active_agent(sid, new_agent)
-                active_agent = new_agent
-        else:
-            if not active_agent:
-                return {
-                    "intent":     intent,
-                    "agent":      None,
-                    "request_id": request_id,
-                    "response": (
-                        "I'm sorry, I couldn't understand your request. "
-                        "Please ask about billing, a complaint, or our products."
-                    ),
-                }, sid
-
+    # Append user message to session
     session_store.append_messages(sid, [{"type": "human", "content": user_message}])
-    history = session_store.get_messages(sid)
 
-    return {
-        "intent":     intent,
-        "agent":      active_agent,
-        "request_id": request_id,
-        "history":    history,
-    }, sid
-
-
-async def stream_from_orchestrator(user_message: str,session_id:   Optional[str],) -> AsyncIterator[str]:
-    info, sid = await _run_chat(user_message, session_id)
-
-    if "response" in info:
-        yield _sse("session", {"session_id": sid})
-        yield _sse("error",   {"message": info["response"]})
-        return
-
-    intent       = info["intent"]
-    active_agent: AgentType = info["agent"]
-    request_id   = info["request_id"]
-    history      = info["history"]
-
-    yield _sse("session", {"session_id": sid})
-    yield _sse("intent",  {
-        "intent":     intent,
-        "agent":      active_agent.value,
-        "request_id": request_id,
-    })
-
-    req = A2ARequest(
-        request_id=request_id,
-        source_agent=AgentType.INTENT_DETECTOR,
-        target_agent=active_agent,
-        user_message=user_message,
-        context={"detected_intent": intent, "session_id": sid},
-        conversation_history=history,
-    )
-
-    base_url   = AGENT_URLS[active_agent]
-    stream_url = base_url.replace("/process", "/process/stream")
+    yield _make_sse("session", {"session_id": sid})
 
     collected_tokens: list[str] = []
+    hitl_data:        dict      = {}
 
-    try:
-        async with httpx.AsyncClient() as client:
-            async with client.stream( "POST", stream_url,  json=req.model_dump(),  timeout=60.0,  ) as response:
-                response.raise_for_status()
+    async for raw in _run_orchestrator(user_message, sid):
+        # Parse every data: line within each SSE chunk for token collection
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                payload = json.loads(line[5:].strip())
+                if payload.get("text"):
+                    collected_tokens.append(payload["text"])
+                if payload.get("ticket_preview"):
+                    hitl_data = payload
+            except json.JSONDecodeError:
+                pass
+        yield raw
 
-                async for raw_line in response.aiter_lines():
-                    if raw_line.startswith("data:"):
-                        try:
-                            payload = json.loads(raw_line[5:].strip())
-                            if payload.get("text"):
-                                collected_tokens.append(payload["text"])
-                        except json.JSONDecodeError:
-                            pass
+    # Write AI response to session
+    ai_text = "".join(collected_tokens)
+    if ai_text:
+        session_store.append_messages(sid, [{"type": "ai", "content": ai_text}])
 
-                    if raw_line:
-                        yield raw_line + "\n"
-                    else:
-                        yield "\n"
-
-        ai_text = "".join(collected_tokens)
-        if ai_text:
-            session_store.append_messages(sid, [{"type": "ai", "content": ai_text}])
-
-    except httpx.ConnectError:
-        yield _sse("error", {
-            "message": (
-                f"The {active_agent.value} agent is currently unavailable. "
-                "Please try again later."
-            )
-        })
-    except httpx.TimeoutException:
-        yield _sse("error", {
-            "message": (
-                f"The {active_agent.value} agent took too long to respond. "
-                "Please try again."
-            )
-        })
-    except httpx.HTTPStatusError as e:
-        yield _sse("error", {
-            "message": (
-                f"The {active_agent.value} agent returned an error "
-                f"(status {e.response.status_code}). Please try again."
-            )
-        })
+    # Surface HITL if present
+    if hitl_data and not hitl_data.get("text"):
+        yield _make_sse("hitl_request", hitl_data)
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Intent Detector — Orchestrator", version="2.0")
-orchestrator: CompiledStateGraph = build_orchestrator_graph()
+app = FastAPI(title="Orchestrator", version="4.0")
 
-
-# ── Internal trace receiver (accepts forwarded events from specialist agents) ─
-
-@app.post("/internal/trace")
-async def internal_trace(event: dict) -> dict:
-    """
-    Receive a trace event forwarded from a specialist agent process and
-    store it in the orchestrator's local trace buffer.
-    The dashboard SSE stream reads from this buffer.
-    """
-    trace_emitter.receive(event)
-    return {"status": "ok"}
-
-
-# ── Chat endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/chat/stream")
 async def chat_stream(payload: ChatRequest) -> StreamingResponse:
-    """
-    Streaming entry point.  Accepts { "message": "...", "session_id": "..." }.
-    First SSE event is always:
-        event: session
-        data: {"session_id": "<uuid>"}
-    followed by the normal intent / tool_call / token / done / error events.
-    """
     return StreamingResponse(
         stream_from_orchestrator(payload.message, payload.session_id),
         media_type="text/event-stream",
@@ -435,127 +331,53 @@ async def chat_stream(payload: ChatRequest) -> StreamingResponse:
 
 @app.post("/chat")
 async def chat(payload: ChatRequest) -> dict:
-    """
-    Blocking entry point — internally calls /process/stream so all trace
-    events (tool_start, tool_end, agent_handoff) fire during execution.
-    Accepts { "message": "...", "session_id": "..." }.
-    Returns { "session_id", "intent", "agent", "request_id", "response" }.
-    """
-    info, sid = await _run_chat(payload.message, payload.session_id)
+    sess = session_store.get_or_create(payload.session_id)
+    sid  = sess.session_id
 
-    if "response" in info:
-        return {
-            "session_id": sid,
-            "intent":     info["intent"],
-            "agent":      None,
-            "request_id": info.get("request_id", ""),
-            "response":   info["response"],
-        }
-
-    active_agent: AgentType = info["agent"]
-    request_id               = info["request_id"]
-    history                  = info["history"]
-
-    trace_emitter.emit(sid, "orchestrator_dispatch",
-                       intent=info["intent"],
-                       target_agent=active_agent.value,
-                       request_id=request_id)
-
-    req = A2ARequest(
-        request_id=request_id,
-        source_agent=AgentType.INTENT_DETECTOR,
-        target_agent=active_agent,
-        user_message=payload.message,
-        context={"detected_intent": info["intent"], "session_id": sid},
-        conversation_history=history,
-    )
-
-    # Use /process/stream (not /process) so astream_events fires inside the
-    # agent — this is what causes tool_start/tool_end trace events to emit.
-    base_url   = AGENT_URLS[active_agent]
-    stream_url = base_url.replace("/process", "/process/stream")
+    session_store.append_messages(sid, [{"type": "human", "content": payload.message}])
 
     collected_tokens: list[str] = []
-    final_result                = ""
-    hitl_data: dict             = {}
+    hitl_data:        dict      = {}
 
-    try:
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST", stream_url,
-                json=req.model_dump(),
-                timeout=60.0,
-            ) as response:
-                response.raise_for_status()
-                async for raw_line in response.aiter_lines():
-                    if not raw_line.startswith("data:"):
-                        continue
-                    try:
-                        payload_data = json.loads(raw_line[5:].strip())
-                        if payload_data.get("text"):
-                            collected_tokens.append(payload_data["text"])
-                        # Capture hitl_request so we can surface it to the caller
-                        if payload_data.get("question"):
-                            hitl_data = payload_data
-                    except json.JSONDecodeError:
-                        pass
+    async for raw in _run_orchestrator(payload.message, sid):
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("event:") and "hitl_request" in line:
+                # Next data: line will have the hitl payload
+                continue
+            if not line.startswith("data:"):
+                continue
+            try:
+                p = json.loads(line[5:].strip())
+                if p.get("text"):
+                    collected_tokens.append(p["text"])
+                # Detect HITL — either via ticket_preview or hitl_pending flag
+                if p.get("ticket_preview") or p.get("hitl_pending"):
+                    hitl_data = p
+            except json.JSONDecodeError:
+                pass
 
-        # HITL takes priority — agent suspended waiting for confirmation
-        if hitl_data:
-            final_result = hitl_data.get("question", "Please confirm the action.")
-        else:
-            final_result = "".join(collected_tokens)
-
-    except httpx.ConnectError:
-        final_result = f"The {active_agent.value} agent is currently unavailable. Please try again later."
-    except httpx.TimeoutException:
-        final_result = f"The {active_agent.value} agent took too long to respond. Please try again."
-    except httpx.HTTPStatusError as e:
-        final_result = f"The {active_agent.value} agent returned an error (status {e.response.status_code}). Please try again."
-    except Exception as e:
-        final_result = f"Error contacting agent: {e}"
-
-    # Write AI reply to session
-    if final_result:
-        session_store.append_messages(sid, [{"type": "ai", "content": final_result}])
-
-    # Detect if billing agent signalled a handoff to complaint.
-    # Trigger phrase: "transferring you to our complaint team"
-    # When detected, set pending_handoff so the next user turn routes to complaint.
-    if (active_agent == AgentType.BILLING and
-            final_result and
-            "transferring" in final_result.lower() and
-            "complaint" in final_result.lower()):
-        session_store.set_metadata(sid, "pending_handoff", "complaint")
-        trace_emitter.emit(sid, "pending_handoff_set",
-                           from_agent="billing",
-                           to_agent="complaint",
-                           reason="billing agent signalled transfer to complaint team")
-
-    agent_label = {
-        AgentType.BILLING:   "Billing Support",
-        AgentType.COMPLAINT: "Complaint Support",
-        AgentType.SALES:     "Sales Support",
-    }.get(active_agent, "Support")
+    final_text = "".join(collected_tokens)
+    if final_text:
+        session_store.append_messages(sid, [{"type": "ai", "content": final_text}])
 
     result = {
         "session_id": sid,
-        "intent":     info["intent"],
-        "agent":      active_agent.value,
-        "request_id": request_id,
-        "response":   f"[{agent_label}]\n\n{final_result}",
+        "response":   final_text,
     }
-
-    # Surface HITL metadata so the client knows it needs to call /process/resume
     if hitl_data:
+        # request_id was stored in session metadata by the dispatch tool
+        rid = session_store.get_metadata(sid, "hitl_pending_request_id")
         result["hitl_pending"]   = True
-        result["hitl_options"]   = hitl_data.get("options", ["Yes", "No"])
+        result["request_id"]     = rid
         result["ticket_preview"] = hitl_data.get("ticket_preview", {})
+        result["hitl_question"]  = hitl_data.get("question", "")
+        result["hitl_options"]   = hitl_data.get("options", ["Yes", "No"])
 
     return result
 
 
-# ── Session management endpoints ──────────────────────────────────────────────
+# ── Session management ────────────────────────────────────────────────────────
 
 @app.post("/session/reset")
 def session_reset(body: SessionResetRequest) -> dict:
@@ -581,31 +403,18 @@ def session_info(session_id: str) -> dict:
     return info
 
 
-# ── Trace endpoint (dashboard) ────────────────────────────────────────────────
+# ── Trace endpoints ───────────────────────────────────────────────────────────
+
+@app.post("/internal/trace")
+async def internal_trace(event: dict) -> dict:
+    trace_emitter.receive(event)
+    return {"status": "ok"}
+
 
 @app.get("/chat/trace/{session_id}")
 async def chat_trace(session_id: str) -> StreamingResponse:
-    """
-    Real-time execution trace stream for the dashboard.
-
-    Subscribe to this SSE endpoint alongside /chat/stream to power a live
-    dashboard showing which agent is active, which tools are running, and
-    internal agent-to-agent handoffs — including during internal calls that
-    are invisible on the user-facing stream.
-
-    Each SSE data payload is a JSON object:
-        {"type": "agent_start"|"agent_end"|"tool_start"|"tool_end"|
-                 "agent_handoff"|"hitl_requested"|"hitl_resumed"|"error",
-         "session_id": "...",
-         "ts": "<ISO-8601 UTC>",
-         ...event-specific fields...}
-
-    The stream stays open until the session is idle for 5 minutes or the
-    client disconnects.
-    """
     if session_store.get(session_id) is None:
-        raise HTTPException(status_code=404,
-                            detail=f"Session '{session_id}' not found.")
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
     return StreamingResponse(
         trace_emitter.stream(session_id, timeout_s=300),
         media_type="text/event-stream",
@@ -615,13 +424,8 @@ async def chat_trace(session_id: str) -> StreamingResponse:
 
 @app.get("/chat/trace/{session_id}/replay")
 def chat_trace_replay(session_id: str) -> dict:
-    """
-    Return all buffered trace events for a session as a JSON array.
-    Useful for replaying a completed session's execution graph in the dashboard.
-    """
     if session_store.get(session_id) is None:
-        raise HTTPException(status_code=404,
-                            detail=f"Session '{session_id}' not found.")
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
     return {"session_id": session_id, "events": trace_emitter.get_events(session_id)}
 
 
@@ -630,8 +434,8 @@ def chat_trace_replay(session_id: str) -> dict:
 @app.get("/health")
 def health():
     return {
-        "status":        "ok",
-        "agent":         "intent_detector",
+        "status":          "ok",
+        "agent":           "orchestrator",
         "active_sessions": len(session_store.all_session_ids()),
     }
 
