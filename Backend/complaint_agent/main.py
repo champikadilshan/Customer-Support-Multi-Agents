@@ -1,7 +1,3 @@
-"""
-complaint_agent/main.py  (v3 — multi-agent collaboration + trace)
-"""
-
 import json
 import operator
 import httpx
@@ -32,8 +28,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 TICKET_SERVICE_URL = f"http://{AGENT_HOST}:{TICKET_SERVICE_PORT}"
 
 
-# ── LangGraph state ───────────────────────────────────────────────────────────
-
 class ComplaintState(TypedDict):
     request_id:          str
     user_message:        str
@@ -53,8 +47,6 @@ class ResumeRequest(BaseModel):
     hitl_response: str
 
 
-# ── Own tools ─────────────────────────────────────────────────────────────────
-
 @tool(
     "get_complaint_history",
     description=(
@@ -70,9 +62,12 @@ def get_complaint_history(customer_id: str) -> list[dict]:
             return [{"error": f"No complaint history found for customer_id '{customer_id}'"}]
         if response.status_code != 200:
             return [{"error": f"Unexpected error (status {response.status_code})"}]
+
         return response.json()
+
     except httpx.ConnectError:
         return [{"error": "Ticket service unavailable."}]
+
     except httpx.TimeoutException:
         return [{"error": "Ticket service timed out."}]
 
@@ -93,9 +88,12 @@ def get_ticket_status(ticket_id: int) -> dict:
                     "error": f"No ticket found with ID {ticket_id}"}
         if response.status_code != 200:
             return {"error": f"Unexpected error (status {response.status_code})"}
+
         return response.json()
+
     except httpx.ConnectError:
         return {"error": "Ticket service unavailable."}
+
     except httpx.TimeoutException:
         return {"error": "Ticket service timed out."}
 
@@ -147,16 +145,11 @@ def categorize_complaint(description: str) -> dict:
         "The ticket is created only after the customer confirms."
     ),
 )
-def stage_ticket_creation(
-    title: str, description: str, customer_id: str, category: str, priority: str,
-) -> dict:
+def stage_ticket_creation(title: str, description: str, customer_id: str, category: str, priority: str,) -> dict:
     return {
         "staged": True, "title": title, "description": description,
         "customer_id": customer_id, "category": category, "priority": priority,
     }
-
-
-# ── Inter-agent tools (unbound — injected per-request in agent_node) ─────────
 
 _call_billing_agent_tool = make_agent_call_tool(
     target=AgentType.BILLING,
@@ -180,11 +173,7 @@ _call_sales_agent_tool = make_agent_call_tool(
 
 OWN_TOOLS = [get_complaint_history, get_ticket_status, categorize_complaint, stage_ticket_creation]
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
-
 llm = get_vertex_llm(temperature=0)
-
-# ── System prompts ────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a compassionate and professional complaint resolution agent for a telecommunications company.
 
@@ -216,8 +205,6 @@ If asked for ticket status or complaint history, fetch and return the data direc
 Use customer_id 'CUST-001' as default if none is specified."""
 
 
-# ── Nodes ─────────────────────────────────────────────────────────────────────
-
 def agent_node(state: ComplaintState) -> ComplaintState:
     is_internal   = state.get("is_internal", False)
     session_id    = state.get("session_id", "")
@@ -226,7 +213,6 @@ def agent_node(state: ComplaintState) -> ComplaintState:
     system_prompt = INTERNAL_PROMPT if is_internal else USER_FACING_PROMPT
 
     if is_internal:
-        # Internal: only own tools, no inter-agent calls, no staging
         all_tools = [get_complaint_history, get_ticket_status]
     else:
         bound_billing = bind_inter_agent_args(
@@ -244,17 +230,15 @@ def agent_node(state: ComplaintState) -> ComplaintState:
         all_tools = [*OWN_TOOLS, bound_billing, bound_sales]
 
     llm_with_tools = llm.bind_tools(all_tools)
-    messages_with_system = [
-        {"role": "system", "content": system_prompt},
-        *state["messages"],
-    ]
+    messages_with_system = [ {"role": "system", "content": system_prompt}, *state["messages"], ]
     response = llm_with_tools.invoke(messages_with_system)
+
     return {"messages": [response]}
 
 
 def hitl_checkpoint_node(state: ComplaintState) -> ComplaintState:
-    # Extract staged ticket data regardless of internal/external
     pending = None
+
     for msg in reversed(state["messages"]):
         if hasattr(msg, "name") and msg.name == "stage_ticket_creation":
             try:
@@ -267,7 +251,6 @@ def hitl_checkpoint_node(state: ComplaintState) -> ComplaintState:
             except (json.JSONDecodeError, AttributeError):
                 pass
 
-    # Internal calls: store pending data but don't suspend — format_response handles it
     if state.get("is_internal", False):
         return {**state, "hitl_pending": False, "pending_ticket_data": pending}
 
@@ -280,6 +263,7 @@ def hitl_resume_node(state: ComplaintState) -> ComplaintState:
 
 def create_ticket_node(state: ComplaintState) -> ComplaintState:
     data = state.get("pending_ticket_data") or {}
+
     try:
         response = httpx.post(
             f"{TICKET_SERVICE_URL}/tickets",
@@ -309,8 +293,6 @@ def create_ticket_node(state: ComplaintState) -> ComplaintState:
 
 
 def format_response_node(state: ComplaintState) -> ComplaintState:
-    # For internal calls that staged a ticket, return a structured summary
-    # so the calling agent (billing) can relay the details to the user.
     if state.get("is_internal", False) and state.get("pending_ticket_data"):
         ticket = state["pending_ticket_data"]
         final = (
@@ -320,6 +302,7 @@ def format_response_node(state: ComplaintState) -> ComplaintState:
             f"Priority: {ticket.get('priority', 'N/A')}. "
             f"Please ask the customer to confirm ticket creation by replying yes or no."
         )
+
         return {**state, "final_response": final}
 
     for msg in reversed(state["messages"]):
@@ -328,6 +311,7 @@ def format_response_node(state: ComplaintState) -> ComplaintState:
             break
     else:
         final = "I was unable to process your complaint at this time. Please try again."
+
     return {**state, "final_response": final}
 
 
@@ -341,16 +325,14 @@ def ticket_declined_node(state: ComplaintState) -> ComplaintState:
     }
 
 
-# ── Conditional edges ─────────────────────────────────────────────────────────
-
 def after_tools_condition(state: ComplaintState) -> Literal["hitl_checkpoint", "format_response", "agent"]:
     for msg in reversed(state.get("messages", [])):
         if hasattr(msg, "name") and msg.name == "stage_ticket_creation":
-            # Internal calls: skip HITL, go straight to format_response
             if state.get("is_internal", False):
                 return "format_response"
-            # User-facing calls: go through HITL confirmation
+
             return "hitl_checkpoint"
+
     return "agent"
 
 
@@ -358,8 +340,6 @@ def after_hitl_resume_condition(state: ComplaintState) -> Literal["create_ticket
     response = (state.get("hitl_response") or "").strip().lower()
     return "create_ticket" if response in ("yes", "y", "confirm", "ok", "sure") else "ticket_declined"
 
-
-# ── Build graph ───────────────────────────────────────────────────────────────
 
 def build_complaint_graph(checkpointer: InMemorySaver) -> CompiledStateGraph:
     all_possible_tools = [*OWN_TOOLS, _call_billing_agent_tool, _call_sales_agent_tool]
@@ -391,8 +371,6 @@ def build_complaint_graph(checkpointer: InMemorySaver) -> CompiledStateGraph:
     return graph.compile(checkpointer=checkpointer, interrupt_before=["hitl_resume"])
 
 
-# ── SSE helpers ───────────────────────────────────────────────────────────────
-
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
@@ -406,11 +384,7 @@ def _extract_text(content) -> str:
     return ""
 
 
-# ── Streaming generator — initial request ─────────────────────────────────────
-
-async def stream_complaint_graph(
-    req: A2ARequest, graph: CompiledStateGraph,
-) -> AsyncIterator[str]:
+async def stream_complaint_graph( req: A2ARequest, graph: CompiledStateGraph,) -> AsyncIterator[str]:
     session_id = req.context.get("session_id", req.request_id)
     config     = {"configurable": {"thread_id": req.request_id}}
 
@@ -419,6 +393,7 @@ async def stream_complaint_graph(
                        triggered_by=req.calling_agent or "orchestrator")
 
     prior_messages = dicts_to_messages(req.conversation_history)
+
     if not prior_messages or not isinstance(prior_messages[-1], HumanMessage):
         prior_messages.append(HumanMessage(content=req.user_message))
 
@@ -456,6 +431,7 @@ async def stream_complaint_graph(
                 chunk = event["data"].get("chunk")
                 if chunk is None:
                     continue
+
                 text = _extract_text(chunk.content)
                 if text and not req.is_internal:
                     yield _sse("token", {"text": text})
@@ -464,13 +440,10 @@ async def stream_complaint_graph(
                 chunk = event.get("data", {}).get("chunk")
                 if not isinstance(chunk, dict):
                     continue
+
                 text = chunk.get("final_response", "")
                 if isinstance(text, str) and text:
-                    # Always emit for internal calls so agent_call_tool collects it.
-                    # For user-facing calls emit only if not going through HITL.
-                    if req.is_internal or not (
-                        hasattr(chunk, "get") and chunk.get("hitl_pending")
-                    ):
+                    if req.is_internal or not ( hasattr(chunk, "get") and chunk.get("hitl_pending") ):
                         yield _sse("token", {"text": text})
 
         snapshot = graph.get_state(config)
@@ -507,16 +480,10 @@ async def stream_complaint_graph(
             yield _sse("error", {"message": str(exc)})
 
 
-# ── Streaming generator — resume after HITL ───────────────────────────────────
-
-async def stream_complaint_resume(
-    request_id: str, hitl_response: str, graph: CompiledStateGraph,
-    session_id: str = "",
-) -> AsyncIterator[str]:
+async def stream_complaint_resume(request_id: str, hitl_response: str, graph: CompiledStateGraph,session_id: str = "",) -> AsyncIterator[str]:
     config = {"configurable": {"thread_id": request_id}}
     graph.update_state(config, {"hitl_response": hitl_response})
-    trace_emitter.emit(session_id or request_id, "hitl_resumed",
-                       agent="complaint", response=hitl_response)
+    trace_emitter.emit(session_id or request_id, "hitl_resumed",  agent="complaint", response=hitl_response)
 
     try:
         async for event in graph.astream_events(None, config, version="v2"):
@@ -537,6 +504,7 @@ async def stream_complaint_resume(
                 chunk = event["data"].get("chunk")
                 if chunk is None:
                     continue
+
                 text = _extract_text(chunk.content)
                 if text:
                     yield _sse("token", {"text": text})
@@ -545,6 +513,7 @@ async def stream_complaint_resume(
                 chunk = event.get("data", {}).get("chunk")
                 if not isinstance(chunk, dict):
                     continue
+
                 text = chunk.get("final_response", "")
                 if isinstance(text, str) and text:
                     yield _sse("token", {"text": text})
@@ -562,8 +531,6 @@ async def stream_complaint_resume(
                            agent="complaint", message=str(exc))
         yield _sse("error", {"message": str(exc)})
 
-
-# ── FastAPI ───────────────────────────────────────────────────────────────────
 
 app            = FastAPI(title="Complaint Agent", version="3.0")
 checkpointer   = InMemorySaver()
@@ -591,15 +558,13 @@ async def process_resume(body: ResumeRequest) -> StreamingResponse:
                     f"No suspended graph found for request_id '{body.request_id}'."
                 )
             })
-        return StreamingResponse(not_found(), media_type="text/event-stream",
-                                 headers={"X-Accel-Buffering": "no"})
 
-    # Retrieve session_id from checkpointed state if available
+        return StreamingResponse(not_found(), media_type="text/event-stream",headers={"X-Accel-Buffering": "no"})
+
     sid = (snapshot.values or {}).get("session_id", body.request_id)
 
     return StreamingResponse(
-        stream_complaint_resume(body.request_id, body.hitl_response,
-                                complaint_graph, session_id=sid),
+        stream_complaint_resume(body.request_id, body.hitl_response,  complaint_graph, session_id=sid),
         media_type="text/event-stream",
         headers={"X-Accel-Buffering": "no"},
     )
@@ -610,9 +575,7 @@ async def process(req: A2ARequest) -> A2AResponse:
     session_id = req.context.get("session_id", req.request_id)
     config     = {"configurable": {"thread_id": req.request_id}}
 
-    trace_emitter.emit(session_id, "agent_start", agent="complaint",
-                       is_internal=req.is_internal,
-                       triggered_by=req.calling_agent or "orchestrator")
+    trace_emitter.emit(session_id, "agent_start", agent="complaint", is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
 
     prior_messages = dicts_to_messages(req.conversation_history)
     if not prior_messages or not isinstance(prior_messages[-1], HumanMessage):
@@ -636,8 +599,7 @@ async def process(req: A2ARequest) -> A2AResponse:
     prior_len     = len(prior_messages)
     new_msgs_dict = messages_to_dicts(result["messages"][prior_len:])
 
-    trace_emitter.emit(session_id, "agent_end", agent="complaint",
-                       status="success", is_internal=req.is_internal)
+    trace_emitter.emit(session_id, "agent_end", agent="complaint",  status="success", is_internal=req.is_internal)
 
     if result.get("hitl_pending"):
         ticket = result.get("pending_ticket_data") or {}

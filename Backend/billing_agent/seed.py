@@ -1,15 +1,3 @@
-"""
-Seed the billing database with sample data for development / testing.
-
-Run once from the project root:
-    python -m billing_agent.seed
-
-Or directly:
-    python billing_agent/seed.py
-
-Idempotent — skips inserts if data for ACC-001 already exists.
-"""
-
 import sys
 from pathlib import Path
 
