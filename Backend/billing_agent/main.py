@@ -1,28 +1,39 @@
+"""
+billing_agent/main.py
+
+Refactored to use langchain.agents.create_agent.
+The custom run_agent_loop is gone — create_agent handles the ReAct cycle.
+"""
+
 import json
 import sys
 import os
 import uvicorn
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage, SystemMessage
-from typing import AsyncIterator
+from langchain.agents import create_agent
+from langchain_core.tools import tool as lc_tool
+from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
+from typing import AsyncIterator, Optional
+from sqlmodel import select
+
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import BILLING_AGENT_PORT
 from shared.llm import get_vertex_llm
 from shared.message_utils import dicts_to_messages, messages_to_dicts
 from shared.agent_call_tool import make_agent_call_tool, bind_inter_agent_args
-from shared.agent_loop import run_agent_loop, get_final_text
+from shared.agent_runner import stream_agent_events
 from shared.trace_emitter import trace_emitter
 from billing_agent.database import create_db_and_tables, get_session
 from billing_agent.models import AccountBalance, Invoice, PaymentMethod
-from sqlmodel import select
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from langchain_core.tools import tool as lc_tool
 
+# ── Tools ─────────────────────────────────────────────────────────────────────
 
 @lc_tool(
     "get_account_balance",
@@ -39,7 +50,6 @@ def get_account_balance(account_id: str) -> dict:
         ).first()
     if not row:
         return {"error": f"No account found for account_id '{account_id}'"}
-
     return {
         "account_id":     row.account_id,
         "balance_due":    row.balance_due,
@@ -67,7 +77,6 @@ def get_invoice_history(account_id: str) -> list[dict]:
         ).all()
     if not rows:
         return [{"error": f"No invoices found for account_id '{account_id}'"}]
-
     return [
         {"invoice_id": r.invoice_id, "date": r.date,
          "amount": r.amount, "status": r.status}
@@ -85,18 +94,19 @@ def get_invoice_history(account_id: str) -> list[dict]:
 )
 def get_payment_methods(account_id: str) -> dict:
     with get_session() as session:
-        rows = session.exec(select(PaymentMethod).where(PaymentMethod.account_id == account_id) ).all()
+        rows = session.exec(
+            select(PaymentMethod).where(PaymentMethod.account_id == account_id)
+        ).all()
     if not rows:
         return {"error": f"No payment methods found for account_id '{account_id}'"}
-
     methods = []
-
     for row in rows:
         entry = {"type": row.type, "last4": row.last4, "default": row.is_default}
-        if row.expiry: entry["expiry"] = row.expiry
-        if row.bank:   entry["bank"]   = row.bank
+        if row.expiry:
+            entry["expiry"] = row.expiry
+        if row.bank:
+            entry["bank"] = row.bank
         methods.append(entry)
-
     return {"account_id": account_id, "payment_methods": methods}
 
 
@@ -112,8 +122,7 @@ _call_complaint_agent_tool = make_agent_call_tool(
 
 OWN_TOOLS = [get_account_balance, get_invoice_history, get_payment_methods]
 
-llm = get_vertex_llm(temperature=0, role="specialist")
-
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a helpful and professional billing support agent for a telecommunications company.
 
@@ -141,20 +150,27 @@ Return a concise, factual answer. Do NOT greet. Do NOT add pleasantries.
 Just fetch the data and return the facts.
 Use account_id 'ACC-001' as default if none is specified in the task."""
 
+# ── LLM ───────────────────────────────────────────────────────────────────────
 
-def _build_messages(req: A2ARequest) -> list:
-    system_prompt = INTERNAL_PROMPT if req.is_internal else USER_FACING_PROMPT
-    prior         = dicts_to_messages(req.conversation_history)
+llm = get_vertex_llm(temperature=0, role="specialist")
 
-    if not prior or not isinstance(prior[-1], HumanMessage):
-        prior.append(HumanMessage(content=req.user_message))
-
-    return [SystemMessage(content=system_prompt), *prior]
+# One InMemorySaver shared across all sessions for this process.
+# In production replace with AsyncPostgresSaver.
+_checkpointer = InMemorySaver()
 
 
-def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
+# ── Agent factory ─────────────────────────────────────────────────────────────
+
+def _build_agent(req: A2ARequest, session_id: str):
+    """
+    Build a create_agent graph scoped to this request.
+
+    Internal calls get a stripped-down tool set and terse system prompt.
+    User-facing calls get the full tool set including the inter-agent call.
+    """
     if req.is_internal:
-        tools = OWN_TOOLS
+        tools = list(OWN_TOOLS)
+        prompt = INTERNAL_PROMPT
     else:
         bound_complaint = bind_inter_agent_args(
             _call_complaint_agent_tool,
@@ -163,28 +179,56 @@ def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
             history=req.conversation_history,
         )
         tools = [*OWN_TOOLS, bound_complaint]
+        prompt = USER_FACING_PROMPT
 
-    return {t.name: t for t in tools if hasattr(t, "name") and t.name}
+    # create_agent replaces llm.bind_tools(...) + the entire run_agent_loop.
+    # It compiles a LangGraph StateGraph internally.
+    return create_agent(
+        llm,
+        tools=tools,
+        system_prompt=prompt,
+        checkpointer=_checkpointer,
+        name="billing",
+    )
 
 
-def _make_llm_with_tools(req: A2ARequest, session_id: str):
-    tool_map = _build_tool_map(req, session_id)
-    tools    = list(tool_map.values())
-    return llm.bind_tools(tools), tool_map
+def _build_messages(req: A2ARequest) -> list[dict]:
+    """Convert A2ARequest history + current message into role-dict list."""
+    msgs = []
+    for d in req.conversation_history:
+        t = d.get("type", "")
+        if t == "human":
+            msgs.append({"role": "user",      "content": d.get("content", "")})
+        elif t == "ai":
+            msgs.append({"role": "assistant", "content": d.get("content", "")})
+        elif t == "tool":
+            msgs.append({"role": "tool",      "content": d.get("content", ""),
+                         "name": d.get("name", ""), "tool_call_id": d.get("tool_call_id", "")})
 
+    # Only append current message if it's not already the last entry
+    last_is_user = msgs and msgs[-1]["role"] == "user" and msgs[-1]["content"] == req.user_message
+    if not last_is_user:
+        msgs.append({"role": "user", "content": req.user_message})
+
+    return msgs
+
+
+# ── Streaming entry point ─────────────────────────────────────────────────────
 
 async def stream_billing_agent(req: A2ARequest) -> AsyncIterator[str]:
     session_id = req.context.get("session_id", req.request_id)
+    trace_emitter.emit(
+        session_id, "agent_start", agent="billing",
+        is_internal=req.is_internal,
+        triggered_by=req.calling_agent or "orchestrator",
+    )
 
-    trace_emitter.emit(session_id, "agent_start", agent="billing", is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
+    agent    = _build_agent(req, session_id)
+    messages = _build_messages(req)
 
-    messages              = _build_messages(req)
-    llm_with_tools, tool_map = _make_llm_with_tools(req, session_id)
-
-    async for chunk in run_agent_loop(
-        llm_with_tools=llm_with_tools,
+    async for chunk in stream_agent_events(
+        agent=agent,
         messages=messages,
-        tool_map=tool_map,
         agent_name="billing",
         session_id=session_id,
         is_internal=req.is_internal,
@@ -192,7 +236,9 @@ async def stream_billing_agent(req: A2ARequest) -> AsyncIterator[str]:
         yield chunk
 
 
-app = FastAPI(title="Billing Agent", version="4.0")
+# ── FastAPI ───────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Billing Agent", version="5.0")
 
 
 @app.on_event("startup")
@@ -212,22 +258,9 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
     session_id = req.context.get("session_id", req.request_id)
-
-    trace_emitter.emit(session_id, "agent_start", agent="billing", is_internal=req.is_internal,triggered_by=req.calling_agent or "orchestrator")
-
-    messages              = _build_messages(req)
-    llm_with_tools, tool_map = _make_llm_with_tools(req, session_id)
-
     final_text = ""
 
-    async for raw in run_agent_loop(
-        llm_with_tools=llm_with_tools,
-        messages=messages,
-        tool_map=tool_map,
-        agent_name="billing",
-        session_id=session_id,
-        is_internal=req.is_internal,
-    ):
+    async for raw in stream_billing_agent(req):
         for line in raw.splitlines():
             line = line.strip()
             if not line.startswith("data:"):
@@ -236,7 +269,6 @@ async def process(req: A2ARequest) -> A2AResponse:
                 payload = json.loads(line[5:].strip())
                 if payload.get("text"):
                     final_text += payload["text"]
-
             except json.JSONDecodeError:
                 pass
 
@@ -255,5 +287,9 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run("billing_agent.main:app", host="0.0.0.0",
-                port=BILLING_AGENT_PORT, reload=True)
+    uvicorn.run(
+        "billing_agent.main:app",
+        host="0.0.0.0",
+        port=BILLING_AGENT_PORT,
+        reload=True,
+    )
