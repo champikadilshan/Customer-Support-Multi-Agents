@@ -16,19 +16,15 @@ class A2ARequest(BaseModel):
     target_agent:         AgentType
     user_message:         str
     context:              dict       = {}
-    # Serialised LangChain messages — agents prepend these to LangGraph state.
     conversation_history: list[dict] = []
-    # Internal call flags — set by make_agent_call_tool, never by the orchestrator.
-    # is_internal=True suppresses greetings, HITL, and further inter-agent calls.
     is_internal:          bool                  = False
-    calling_agent:        Optional[str]         = None   # AgentType.value string
+    calling_agent:        Optional[str]         = None
 
 
 class A2AResponse(BaseModel):
     request_id:   str
     source_agent: AgentType
-    status:       str           # "success" | "error" | "hitl_pending"
+    status:       str
     result:       str
     metadata:     dict          = {}
-    # New messages produced this turn — orchestrator writes back to session store.
     new_messages: list[dict]    = []
