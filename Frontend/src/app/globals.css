@@ -91,6 +91,11 @@
     pointer-events: none;
     overflow: visible;
     z-index: 1;
+    transition: opacity 500ms;
+  }
+
+  .agent-flow-canvas .react-flow__node.agent-flow-node--dimmed {
+    opacity: 0.4;
   }
 
   .agent-flow-canvas .react-flow__node > div {
