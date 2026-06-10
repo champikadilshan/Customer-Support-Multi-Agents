@@ -112,7 +112,7 @@ _call_complaint_agent_tool = make_agent_call_tool(
 
 OWN_TOOLS = [get_account_balance, get_invoice_history, get_payment_methods]
 
-llm = get_vertex_llm(temperature=0)
+llm = get_vertex_llm(temperature=0, role="specialist")
 
 
 USER_FACING_PROMPT = """You are a helpful and professional billing support agent for a telecommunications company.

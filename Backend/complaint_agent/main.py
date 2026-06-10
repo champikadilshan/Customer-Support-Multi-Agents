@@ -184,7 +184,7 @@ _call_sales_agent_tool = make_agent_call_tool(
 )
 
 OWN_TOOLS = [get_complaint_history, get_ticket_status, categorize_complaint, stage_ticket_creation, create_ticket,]
-llm = get_vertex_llm(temperature=0)
+llm = get_vertex_llm(temperature=0, role="specialist")
 
 
 USER_FACING_PROMPT = """You are a compassionate and professional complaint resolution agent for a telecommunications company.
