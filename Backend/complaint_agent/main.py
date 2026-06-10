@@ -1,21 +1,42 @@
+"""
+complaint_agent/main.py
+
+HITL uses interrupt_before=["tools"] on create_agent directly — NOT
+HumanInTheLoopMiddleware.
+
+Reason: HumanInTheLoopMiddleware calls get_config() internally which
+fails with "Called get_config outside of a runnable context" when the
+agent is invoked via .astream() or .ainvoke() (confirmed bug #34974).
+
+interrupt_before=["tools"] is LangGraph's native interrupt mechanism.
+It pauses the graph before the tools node fires, persists full state
+in the checkpointer, and waits for Command(resume=...) — zero context
+variable issues because it never leaves LangGraph's executor.
+
+The HITL question is built from the pending tool call in the
+interrupted graph state, which create_agent exposes via .get_state().
+"""
+
 import json
-import httpx
 import sys
 import os
 import uvicorn
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain.agents import create_agent
 from langchain_core.tools import tool as lc_tool
-from typing import AsyncIterator, Optional
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 from pydantic import BaseModel
+from typing import AsyncIterator
+import httpx
+
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import COMPLAINT_AGENT_PORT, AGENT_HOST, TICKET_SERVICE_PORT
 from shared.llm import get_vertex_llm
-from shared.message_utils import dicts_to_messages, messages_to_dicts
 from shared.agent_call_tool import make_agent_call_tool, bind_inter_agent_args
-from shared.agent_loop import run_agent_loop, get_final_text
+from shared.agent_runner import stream_agent_events, resume_agent
 from shared.trace_emitter import trace_emitter
 from shared.session_store import session_store
 
@@ -23,6 +44,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 TICKET_SERVICE_URL = f"http://{AGENT_HOST}:{TICKET_SERVICE_PORT}"
 
+# ── Tools ─────────────────────────────────────────────────────────────────────
 
 @lc_tool(
     "get_complaint_history",
@@ -32,18 +54,19 @@ TICKET_SERVICE_URL = f"http://{AGENT_HOST}:{TICKET_SERVICE_PORT}"
         "the status of an existing issue, or wants to see their complaint history."
     ),
 )
-def get_complaint_history(customer_id: str) -> list[dict]:
+async def get_complaint_history(customer_id: str) -> list[dict]:
     try:
-        r = httpx.get(f"{TICKET_SERVICE_URL}/tickets/customer/{customer_id}", timeout=10.0)
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{TICKET_SERVICE_URL}/tickets/customer/{customer_id}", timeout=10.0
+            )
         if r.status_code == 404:
             return [{"error": f"No complaint history found for customer_id '{customer_id}'"}]
         if r.status_code != 200:
             return [{"error": f"Unexpected error (status {r.status_code})"}]
         return r.json()
-
     except httpx.ConnectError:
         return [{"error": "Ticket service unavailable."}]
-
     except httpx.TimeoutException:
         return [{"error": "Ticket service timed out."}]
 
@@ -55,19 +78,20 @@ def get_complaint_history(customer_id: str) -> list[dict]:
         "Use this when the user provides a ticket ID and wants an update."
     ),
 )
-def get_ticket_status(ticket_id: int) -> dict:
+async def get_ticket_status(ticket_id: int) -> dict:
     try:
-        r = httpx.get(f"{TICKET_SERVICE_URL}/tickets/{ticket_id}", timeout=10.0)
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{TICKET_SERVICE_URL}/tickets/{ticket_id}", timeout=10.0
+            )
         if r.status_code == 404:
             return {"ticket_id": ticket_id, "status": "Not Found",
                     "error": f"No ticket found with ID {ticket_id}"}
         if r.status_code != 200:
             return {"error": f"Unexpected error (status {r.status_code})"}
         return r.json()
-
     except httpx.ConnectError:
         return {"error": "Ticket service unavailable."}
-
     except httpx.TimeoutException:
         return {"error": "Ticket service timed out."}
 
@@ -76,7 +100,7 @@ def get_ticket_status(ticket_id: int) -> dict:
     "categorize_complaint",
     description=(
         "Analyse a complaint description and return the category and recommended priority. "
-        "Use this at the start of handling any new complaint before staging a ticket. "
+        "Use this at the start of handling any new complaint before creating a ticket. "
         "Categories: billing_dispute, service_outage, product_defect, "
         "refund_request, rude_staff, delivery_issue, other."
     ),
@@ -113,50 +137,39 @@ def categorize_complaint(description: str) -> dict:
 
 
 @lc_tool(
-    "stage_ticket_creation",
-    description=(
-        "Stage a support ticket for creation pending customer confirmation. "
-        "Does NOT create the ticket yet — only after the customer confirms. "
-        "Always call categorize_complaint first to get category and priority."
-    ),
-)
-def stage_ticket_creation( title: str, description: str, customer_id: str, category: str, priority: str,) -> dict:
-    return {
-        "staged": True, "title": title, "description": description,
-        "customer_id": customer_id, "category": category, "priority": priority,
-    }
-
-
-@lc_tool(
     "create_ticket",
     description=(
         "Create a support ticket in the ticket service. "
-        "Call this ONLY after the customer has confirmed they want the ticket raised. "
-        "Use the exact details from the staged ticket."
+        "The system will pause and ask the customer to confirm before this executes. "
+        "Always call categorize_complaint first to get category and priority."
     ),
 )
-def create_ticket(title: str, description: str, customer_id: str, category: str, priority: str,) -> dict:
+async def create_ticket(
+    title: str,
+    description: str,
+    customer_id: str,
+    category: str,
+    priority: str,
+) -> dict:
     try:
-        r = httpx.post(
-            f"{TICKET_SERVICE_URL}/tickets",
-            json={"title": title, "description": description,
-                  "customer_id": customer_id, "category": category,
-                  "priority": priority},
-            timeout=10.0,
-        )
-
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{TICKET_SERVICE_URL}/tickets",
+                json={"title": title, "description": description,
+                      "customer_id": customer_id, "category": category,
+                      "priority": priority},
+                timeout=10.0,
+            )
         r.raise_for_status()
         ticket = r.json()
-
         return {
-            "success":     True,
-            "ticket_id":   ticket["id"],
-            "title":       ticket["title"],
-            "status":      ticket["status"],
-            "category":    ticket.get("category"),
-            "priority":    ticket.get("priority"),
+            "success":   True,
+            "ticket_id": ticket["id"],
+            "title":     ticket["title"],
+            "status":    ticket["status"],
+            "category":  ticket.get("category"),
+            "priority":  ticket.get("priority"),
         }
-
     except httpx.ConnectError:
         return {"error": "Ticket service unavailable."}
     except httpx.TimeoutException:
@@ -169,8 +182,7 @@ _call_billing_agent_tool = make_agent_call_tool(
     target=AgentType.BILLING,
     description=(
         "Call the billing agent to fetch account balance, invoice history, or payment methods. "
-        "Use this when the customer disputes a charge related to their complaint. "
-        "Pass a clear task description including the account_id if known."
+        "Use this when the customer disputes a charge related to their complaint."
     ),
 )
 
@@ -179,13 +191,16 @@ _call_sales_agent_tool = make_agent_call_tool(
     description=(
         "Call the sales agent for product upgrade or plan recommendations. "
         "Use this ONLY after the current complaint is fully resolved AND the customer "
-        "explicitly asks about upgrading. Do NOT call during active complaint handling."
+        "explicitly asks about upgrading."
     ),
 )
 
-OWN_TOOLS = [get_complaint_history, get_ticket_status, categorize_complaint, stage_ticket_creation, create_ticket,]
-llm = get_vertex_llm(temperature=0, role="specialist")
+OWN_TOOLS = [
+    get_complaint_history, get_ticket_status,
+    categorize_complaint, create_ticket,
+]
 
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a compassionate and professional complaint resolution agent for a telecommunications company.
 
@@ -196,163 +211,225 @@ CONVERSATION BEHAVIOUR:
    Ask ONE clarifying question at a time. Never re-ask for information already given.
 4. When ready to raise a ticket:
    a. Call categorize_complaint to get category and priority.
-   b. Call stage_ticket_creation with those details.
-   Do NOT announce what you are about to do — just call the tools.
-   The system will pause and ask the customer to confirm before creating the ticket.
-5. After the customer confirms (you will receive their yes/no in the conversation),
-   if they said yes: call create_ticket with the staged details.
-   if they said no: acknowledge and close gracefully.
-6. For history lookups or status checks use get_complaint_history or get_ticket_status.
-7. Never expose raw JSON — translate everything into friendly language.
-8. Close warmly if the customer says goodbye.
+   b. Call create_ticket with those details.
+   The system will automatically pause and ask the customer to confirm.
+5. For history lookups or status checks use get_complaint_history or get_ticket_status.
+6. Never expose raw JSON — translate everything into friendly language.
+7. Close warmly if the customer says goodbye.
 
 COLLABORATION:
-- call_billing_agent: use ONLY when the customer disputes a charge related to their
-  complaint and you need billing data to support resolution.
+- call_billing_agent: use ONLY when the customer disputes a charge related to their complaint.
 - call_sales_agent: use ONLY after complaint is fully resolved and customer asks about plans.
 - Never make both calls in the same turn."""
 
 INTERNAL_PROMPT = """You are the complaint agent responding to an internal request from another agent.
-Return concise, factual data. Do NOT greet. Do NOT trigger ticket staging.
+Return concise, factual data. Do NOT greet. Do NOT trigger ticket creation.
 Only use get_complaint_history and get_ticket_status. Return the data directly."""
 
+# ── LLM + checkpointer ────────────────────────────────────────────────────────
 
-def _build_messages(req: A2ARequest) -> list:
-    system_prompt = INTERNAL_PROMPT if req.is_internal else USER_FACING_PROMPT
-    prior         = dicts_to_messages(req.conversation_history)
-    if not prior or not isinstance(prior[-1], HumanMessage):
-        prior.append(HumanMessage(content=req.user_message))
+llm           = get_vertex_llm(temperature=0, role="specialist")
+_checkpointer = InMemorySaver()  # production: AsyncPostgresSaver
 
-    return [SystemMessage(content=system_prompt), *prior]
+# ── Agent factory ─────────────────────────────────────────────────────────────
 
-
-def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
+def _build_agent(req: A2ARequest, session_id: str):
     if req.is_internal:
-        tools = [get_complaint_history, get_ticket_status]
-    else:
-        bound_billing = bind_inter_agent_args(
-            _call_billing_agent_tool,
-            session_id=session_id,
-            calling_agent=AgentType.COMPLAINT.value,
-            history=req.conversation_history,
+        return create_agent(
+            llm,
+            tools=[get_complaint_history, get_ticket_status],
+            system_prompt=INTERNAL_PROMPT,
+            checkpointer=_checkpointer,
+            name="complaint",
         )
-        bound_sales = bind_inter_agent_args(
-            _call_sales_agent_tool,
-            session_id=session_id,
-            calling_agent=AgentType.COMPLAINT.value,
-            history=req.conversation_history,
-        )
-        tools = [*OWN_TOOLS, bound_billing, bound_sales]
 
-    return {t.name: t for t in tools if hasattr(t, "name") and t.name}
+    bound_billing = bind_inter_agent_args(
+        _call_billing_agent_tool,
+        session_id=session_id,
+        calling_agent=AgentType.COMPLAINT.value,
+        history=req.conversation_history,
+    )
+    bound_sales = bind_inter_agent_args(
+        _call_sales_agent_tool,
+        session_id=session_id,
+        calling_agent=AgentType.COMPLAINT.value,
+        history=req.conversation_history,
+    )
+
+    # interrupt_before=["tools"] is LangGraph's native HITL mechanism.
+    # It pauses the graph BEFORE the tools node executes, persists state
+    # in the checkpointer, and waits for Command(resume=...).
+    # No middleware, no get_config() calls, no context variable issues.
+    return create_agent(
+        llm,
+        tools=[*OWN_TOOLS, bound_billing, bound_sales],
+        system_prompt=USER_FACING_PROMPT,
+        checkpointer=_checkpointer,
+        interrupt_before=["tools"],
+        name="complaint",
+    )
+
+
+def _build_messages(req: A2ARequest) -> list[dict]:
+    msgs = []
+    for d in req.conversation_history:
+        t = d.get("type", "")
+        if t == "human":
+            msgs.append({"role": "user",      "content": d.get("content", "")})
+        elif t == "ai":
+            msgs.append({"role": "assistant", "content": d.get("content", "")})
+        elif t == "tool":
+            msgs.append({"role": "tool",      "content": d.get("content", ""),
+                         "name": d.get("name", ""), "tool_call_id": d.get("tool_call_id", "")})
+    last_is_user = msgs and msgs[-1]["role"] == "user" and msgs[-1]["content"] == req.user_message
+    if not last_is_user:
+        msgs.append({"role": "user", "content": req.user_message})
+    return msgs
+
+
+def _get_pending_tool_call(agent, session_id: str) -> dict:
+    """
+    After an interrupt_before=["tools"] pause, read the pending tool call
+    from the graph's checkpointed state.
+
+    create_agent's state schema has a "messages" key. The last AIMessage
+    in that list contains the tool_calls the model wanted to make.
+    We look specifically for create_ticket to build the HITL preview.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    try:
+        state = agent.get_state(config)
+        messages = state.values.get("messages", [])
+        for msg in reversed(messages):
+            tool_calls = getattr(msg, "tool_calls", [])
+            for tc in tool_calls:
+                if tc.get("name") == "create_ticket":
+                    return tc.get("args", {})
+    except Exception:
+        pass
+    return {}
+
+
+# ── Streaming entry points ────────────────────────────────────────────────────
+
+async def stream_complaint_agent(req: A2ARequest) -> AsyncIterator[str]:
+    session_id = req.context.get("session_id", req.request_id)
+    trace_emitter.emit(
+        session_id, "agent_start", agent="complaint",
+        is_internal=req.is_internal,
+        triggered_by=req.calling_agent or "orchestrator",
+    )
+
+    session_store.get_or_create(session_id)
+    session_store.set_metadata(session_id, "last_request_id", req.request_id)
+
+    agent    = _build_agent(req, session_id)
+    messages = _build_messages(req)
+
+    hitl_triggered = False
+
+    async for chunk in stream_agent_events(
+        agent=agent,
+        messages=messages,
+        agent_name="complaint",
+        session_id=session_id,
+        is_internal=req.is_internal,
+    ):
+        # Intercept hitl_request events to enrich with ticket preview
+        # from the checkpointed state — this is the graph's own public state,
+        # not an internal structure inspection.
+        if "hitl_request" in chunk and not hitl_triggered:
+            hitl_triggered = True
+            args = _get_pending_tool_call(agent, session_id)
+            if args:
+                title    = args.get("title",    "Support Ticket")
+                category = args.get("category", "N/A")
+                priority = args.get("priority", "N/A")
+                payload  = {
+                    "question": (
+                        f"I'd like to raise a support ticket on your behalf:\n\n"
+                        f"  Title:    {title}\n"
+                        f"  Category: {category}\n"
+                        f"  Priority: {priority}\n\n"
+                        f"Shall I go ahead and create it?"
+                    ),
+                    "ticket_preview": {
+                        "title":       title,
+                        "description": args.get("description", ""),
+                        "customer_id": args.get("customer_id"),
+                        "category":    category,
+                        "priority":    priority,
+                    },
+                    "options": ["Yes, raise it", "No, skip it"],
+                }
+                yield f"event: hitl_request\ndata: {json.dumps(payload)}\n\n"
+                return
+        yield chunk
+
+
+async def stream_complaint_resume(
+    session_id: str,
+    hitl_response: str,
+) -> AsyncIterator[str]:
+    """
+    Resume after HITL confirmation.
+
+    If confirmed: Command(resume=None) lets the tools node proceed.
+    If rejected:  Command(resume=...) with a skip instruction or we
+                  update state to remove the pending tool call.
+    """
+    confirmed = hitl_response.strip().lower() in (
+        "yes", "y", "confirm", "ok", "sure", "yes, raise it", "approve"
+    )
+
+    req_placeholder = A2ARequest(
+        request_id=session_id,
+        source_agent=AgentType.COMPLAINT,
+        target_agent=AgentType.COMPLAINT,
+        user_message="",
+        is_internal=False,
+    )
+    agent  = _build_agent(req_placeholder, session_id)
+    config = {"configurable": {"thread_id": session_id}}
+
+    if confirmed:
+        # Resume — let the tools node execute normally
+        resume_cmd = Command(resume=None)
+    else:
+        # Reject — update graph state to clear pending tool calls,
+        # then resume so the model can respond gracefully
+        state = agent.get_state(config)
+        messages = list(state.values.get("messages", []))
+        if messages:
+            last_msg = messages[-1]
+            if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                # Replace tool_calls with empty list so the model
+                # treats it as a normal turn with no pending action
+                from langchain_core.messages import AIMessage
+                messages[-1] = AIMessage(
+                    content="The customer declined to raise a ticket.",
+                    tool_calls=[],
+                )
+                agent.update_state(config, {"messages": messages})
+        resume_cmd = Command(resume=None)
+
+    async for chunk in resume_agent(
+        agent=agent,
+        session_id=session_id,
+        agent_name="complaint",
+        resume_value=resume_cmd.resume,
+    ):
+        yield chunk
+
+
+# ── FastAPI ───────────────────────────────────────────────────────────────────
 
 class ResumeRequest(BaseModel):
     request_id:    str
     hitl_response: str
 
 
-async def stream_complaint_agent(req: A2ARequest) -> AsyncIterator[str]:
-    session_id = req.context.get("session_id", req.request_id)
-
-    trace_emitter.emit(session_id, "agent_start", agent="complaint", is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
-
-    messages = _build_messages(req)
-    tool_map = _build_tool_map(req, session_id)
-    llm_with_tools = llm.bind_tools(list(tool_map.values()))
-
-    pending_hitl = False
-
-    async for chunk in run_agent_loop(
-        llm_with_tools=llm_with_tools,
-        messages=messages,
-        tool_map=tool_map,
-        agent_name="complaint",
-        session_id=session_id,
-        is_internal=req.is_internal,
-    ):
-        lines = chunk.splitlines()
-        is_hitl_chunk = any(
-            l.strip().startswith("event:") and "hitl_request" in l
-            for l in lines
-        )
-
-        if is_hitl_chunk:
-            for line in lines:
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                try:
-                    payload = json.loads(line[5:].strip())
-                    if payload.get("ticket_preview") or payload.get("pending_messages") is not None:
-
-                        session_store.get_or_create(session_id)
-                        session_store.set_metadata(session_id, "hitl_pending_request_id", req.request_id)
-                        session_store.set_metadata(session_id, "hitl_pending_messages", payload.get("pending_messages", []))
-                        session_store.set_metadata(session_id, "hitl_ticket_data", payload.get("ticket_preview", {}))
-                        trace_emitter.emit(session_id, "hitl_requested", agent="complaint", ticket_preview=payload.get("ticket_preview", {}))
-
-                        client_payload = {k: v for k, v in payload.items()
-                                          if k != "pending_messages"}
-                        yield f"event: hitl_request\ndata: {json.dumps(client_payload)}\n\n"
-
-                        return
-                except (json.JSONDecodeError, KeyError):
-                    pass
-        else:
-            yield chunk
-
-
-async def stream_complaint_resume( request_id: str, hitl_response: str, session_id: str) -> AsyncIterator[str]:
-    pending_messages_dicts = session_store.get_metadata(session_id, "hitl_pending_messages")
-    ticket_data            = session_store.get_metadata(session_id, "hitl_ticket_data") or {}
-
-    if not pending_messages_dicts:
-        yield f"event: error\ndata: {json.dumps({'message': 'No suspended session found.'})}\n\n"
-
-        return
-
-    trace_emitter.emit(session_id, "hitl_resumed",
-                       agent="complaint", response=hitl_response)
-
-    messages = dicts_to_messages(pending_messages_dicts)
-
-    confirmed   = hitl_response.strip().lower() in ("yes", "y", "confirm", "ok", "sure")
-
-    user_text   = (
-        f"Yes, please create the ticket: {ticket_data.get('title', 'Support Ticket')}"
-        if confirmed
-        else "No, please don't raise the ticket."
-    )
-
-    messages.append(HumanMessage(content=user_text))
-
-    tool_map = {
-        t.name: t for t in [
-            get_complaint_history, get_ticket_status,
-            categorize_complaint, stage_ticket_creation, create_ticket,
-        ]
-    }
-
-    llm_with_tools = llm.bind_tools(list(tool_map.values()))
-
-    async for chunk in run_agent_loop(
-        llm_with_tools=llm_with_tools,
-        messages=messages,
-        tool_map=tool_map,
-        agent_name="complaint",
-        session_id=session_id,
-        is_internal=False,
-    ):
-        yield chunk
-
-    session_store.set_metadata(session_id, "hitl_pending_messages",  None)
-    session_store.set_metadata(session_id, "hitl_ticket_data",       None)
-    session_store.set_metadata(session_id, "hitl_pending_request_id", None)
-
-    trace_emitter.emit(session_id, "agent_end", agent="complaint", status="success")
-
-
-app = FastAPI(title="Complaint Agent", version="4.0")
+app = FastAPI(title="Complaint Agent", version="5.0")
 
 
 @app.post("/process/stream")
@@ -367,21 +444,19 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
 @app.post("/process/resume")
 async def process_resume(body: ResumeRequest) -> StreamingResponse:
     session_id = None
-
     for sid in session_store.all_session_ids():
-        stored_rid = session_store.get_metadata(sid, "hitl_pending_request_id")
-        if stored_rid == body.request_id:
+        if session_store.get_metadata(sid, "last_request_id") == body.request_id:
             session_id = sid
             break
 
     if not session_id:
         async def not_found():
-            yield (f"event: error\ndata: {json.dumps({'message': 'No suspended session found '})}\n\n")
-
-        return StreamingResponse(not_found(), media_type="text/event-stream",headers={"X-Accel-Buffering": "no"})
+            yield f"event: error\ndata: {json.dumps({'message': 'No suspended session found.'})}\n\n"
+        return StreamingResponse(not_found(), media_type="text/event-stream",
+                                 headers={"X-Accel-Buffering": "no"})
 
     return StreamingResponse(
-        stream_complaint_resume(body.request_id, body.hitl_response, session_id),
+        stream_complaint_resume(session_id, body.hitl_response),
         media_type="text/event-stream",
         headers={"X-Accel-Buffering": "no"},
     )
@@ -390,24 +465,10 @@ async def process_resume(body: ResumeRequest) -> StreamingResponse:
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
     session_id = req.context.get("session_id", req.request_id)
+    final_text = ""
+    hitl_data  = {}
 
-    trace_emitter.emit(session_id, "agent_start", agent="complaint", is_internal=req.is_internal,triggered_by=req.calling_agent or "orchestrator")
-
-    messages       = _build_messages(req)
-    tool_map       = _build_tool_map(req, session_id)
-    llm_with_tools = llm.bind_tools(list(tool_map.values()))
-
-    final_text  = ""
-    hitl_data   = {}
-
-    async for raw in run_agent_loop(
-        llm_with_tools=llm_with_tools,
-        messages=messages,
-        tool_map=tool_map,
-        agent_name="complaint",
-        session_id=session_id,
-        is_internal=req.is_internal,
-    ):
+    async for raw in stream_complaint_agent(req):
         for line in raw.splitlines():
             line = line.strip()
             if not line.startswith("data:"):
@@ -418,16 +479,10 @@ async def process(req: A2ARequest) -> A2AResponse:
                     final_text += payload["text"]
                 if payload.get("ticket_preview"):
                     hitl_data = payload
-                    session_store.set_metadata(session_id, "hitl_pending_request_id", req.request_id)
-                    session_store.set_metadata(session_id, "hitl_pending_messages",
-                                               payload.get("pending_messages", []))
-                    session_store.set_metadata(session_id, "hitl_ticket_data",
-                                               payload.get("ticket_preview", {}))
             except json.JSONDecodeError:
                 pass
 
     if hitl_data:
-        ticket = hitl_data.get("ticket_preview", {})
         return A2AResponse(
             request_id=req.request_id,
             source_agent=AgentType.COMPLAINT,
@@ -435,8 +490,8 @@ async def process(req: A2ARequest) -> A2AResponse:
             result=hitl_data.get("question", "Please confirm ticket creation."),
             metadata={
                 "hitl_pending":    True,
-                "ticket_preview":  ticket,
-                "resume_endpoint": f"/process/resume",
+                "ticket_preview":  hitl_data.get("ticket_preview", {}),
+                "resume_endpoint": "/process/resume",
             },
         )
 
@@ -455,5 +510,9 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run("complaint_agent.main:app", host="0.0.0.0",
-                port=COMPLAINT_AGENT_PORT, reload=True)
+    uvicorn.run(
+        "complaint_agent.main:app",
+        host="0.0.0.0",
+        port=COMPLAINT_AGENT_PORT,
+        reload=True,
+    )
