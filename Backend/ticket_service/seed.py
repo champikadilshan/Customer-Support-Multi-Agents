@@ -10,7 +10,6 @@ Or directly:
 WIPE_AND_RESEED = True  → deletes ALL existing rows then inserts fresh data
 WIPE_AND_RESEED = False → skips insert if tickets already exist (safe default)
 """
-
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -21,9 +20,7 @@ from sqlmodel import Session, select, delete
 from ticket_service.main import engine, on_startup
 from ticket_service.models import Ticket, TicketStatus
 
-# ─────────────────────────────────────────────
-#  CONTROL FLAG  ← change this to wipe & reseed
-# ─────────────────────────────────────────────
+
 WIPE_AND_RESEED: bool = False
 
 
@@ -296,7 +293,6 @@ TICKETS = [
 
 
 # ── SEED FUNCTION ─────────────────────────────────────────────────────────────
-
 def seed() -> None:
     on_startup()
 

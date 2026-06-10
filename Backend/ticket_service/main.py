@@ -10,7 +10,7 @@ from ticket_service.models import (Ticket,TicketCreate, TicketResponse, TicketSt
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# DATABASE SETUP
+
 DB_PATH      = Path(__file__).resolve().parent / "tickets.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 engine       = create_engine(DATABASE_URL, echo=False)
@@ -20,7 +20,7 @@ def get_session():
     with Session(engine) as session:
         yield session
 
-# APP
+
 app = FastAPI(
     title="Ticket Service",
     description="Customer Support Ticket Service for Multi-Agent System",
@@ -30,11 +30,9 @@ app = FastAPI(
 
 @app.on_event("startup")
 def on_startup():
-    """Create DB tables on first run. Safe to call on every restart."""
     SQLModel.metadata.create_all(engine)
 
 
-# ROUTES
 @app.post("/tickets", response_model=TicketResponse, status_code=201)
 def create_ticket(payload: TicketCreate,session: Session = Depends(get_session),):
     """Create a new support ticket."""
@@ -47,16 +45,11 @@ def create_ticket(payload: TicketCreate,session: Session = Depends(get_session),
 
 @app.get("/tickets", response_model=list[TicketResponse])
 def list_tickets(session: Session = Depends(get_session)):
-    """List all tickets, most recent first."""
     return session.exec( select(Ticket).order_by(Ticket.created_at.desc())).all()
 
 
 @app.get("/tickets/customer/{customer_id}", response_model=list[TicketResponse])
 def get_tickets_by_customer(customer_id: str,session: Session = Depends(get_session),):
-    """
-    Get all tickets for a given customer, ordered by most recent first.
-    Used by the complaint agent's get_complaint_history tool.
-    """
     tickets = session.exec( select(Ticket) .where(Ticket.customer_id == customer_id) .order_by(Ticket.created_at.desc())).all()
 
     if not tickets:
@@ -70,7 +63,6 @@ def get_tickets_by_customer(customer_id: str,session: Session = Depends(get_sess
 
 @app.get("/tickets/{ticket_id}", response_model=TicketResponse)
 def get_ticket(ticket_id: int,session: Session = Depends(get_session),):
-    """Get a single ticket's details and current status."""
     ticket = session.get(Ticket, ticket_id)
 
     if not ticket:
@@ -84,10 +76,6 @@ def get_ticket(ticket_id: int,session: Session = Depends(get_session),):
 
 @app.patch("/tickets/{ticket_id}", response_model=TicketResponse)
 def update_ticket(ticket_id: int, payload: TicketUpdate, session: Session = Depends(get_session),):
-    """
-    Update a ticket's status, category, priority, or assigned_to.
-    Only fields explicitly provided in the request body are updated.
-    """
     ticket = session.get(Ticket, ticket_id)
     if not ticket:
         raise HTTPException(
@@ -96,6 +84,7 @@ def update_ticket(ticket_id: int, payload: TicketUpdate, session: Session = Depe
         )
 
     update_data = payload.model_dump(exclude_none=True)
+
     for field, value in update_data.items():
         setattr(ticket, field, value)
 
@@ -112,7 +101,6 @@ def health():
     return {"status": "ok", "service": "ticket_service"}
 
 
-# ENTRY POINT
 if __name__ == "__main__":
     uvicorn.run(
         "ticket_service.main:app",
