@@ -99,12 +99,11 @@ export const TOOL_INFRA_ACTIVATION: Record<
     nodes: ["hitl"],
     edges: [["complaint", "hitl"]],
   },
+  // First create_ticket call (pre-HITL) only lights Ticket Service — not Ticket DB.
+  // Second call after HITL resume adds Ticket DB in trace.ts via createTicketPhase.
   create_ticket: {
-    nodes: ["ticket_api", "ticket_db"],
-    edges: [
-      ["complaint", "ticket_api"],
-      ["ticket_api", "ticket_db"],
-    ],
+    nodes: ["ticket_api"],
+    edges: [["complaint", "ticket_api"]],
   },
 }
 

@@ -2,88 +2,98 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 
-import {
-  createInitialAgentGraphState,
-  setNode,
-  type AgentNodeId,
-} from "@/lib/agent-graph"
+import { createInitialAgentGraphState } from "@/lib/agent-graph"
 import {
   connectAgentTrace,
   fetchTraceReplay,
-  getFlashResetTargets,
   reduceAgentGraphOnTraceEvent,
   type TraceEvent,
 } from "@/lib/trace"
-
-const FLASH_RESET_MS = 1500
+import {
+  createGraphSmoothingClock,
+  minResyncDelay,
+  smoothGraphDisplay,
+} from "@/lib/trace-graph-smoothing"
 
 export function useAgentTrace(sessionId: string | null) {
   const [agentGraph, setAgentGraph] = useState(createInitialAgentGraphState)
   const abortRef = useRef<AbortController | null>(null)
-  const sessionRef = useRef<string | null>(null)
-  const flashTimersRef = useRef<Map<AgentNodeId, number>>(new Map())
   const replayAbortRef = useRef(false)
+  const logicalGraphRef = useRef(createInitialAgentGraphState())
+  const smoothingClockRef = useRef(createGraphSmoothingClock())
+  const resyncTimerRef = useRef<number | null>(null)
 
-  const scheduleFlashReset = useCallback((nodeIds: AgentNodeId[]) => {
-    for (const nodeId of nodeIds) {
-      const existing = flashTimersRef.current.get(nodeId)
-      if (existing) window.clearTimeout(existing)
-
-      const timer = window.setTimeout(() => {
-        flashTimersRef.current.delete(nodeId)
-        setAgentGraph((current) => {
-          if (current.nodes[nodeId].status !== "completed") return current
-
-          let next = setNode(current, nodeId, "idle")
-          next = {
-            ...next,
-            edges: next.edges.map((edge) =>
-              (edge.from === nodeId || edge.to === nodeId) &&
-              edge.status === "completed"
-                ? { ...edge, status: "idle" }
-                : edge
-            ),
-            handoffs: next.handoffs.map((handoff) =>
-              handoff.status === "completed"
-                ? { ...handoff, status: "idle" }
-                : handoff
-            ),
-          }
-          return next
-        })
-      }, FLASH_RESET_MS)
-
-      flashTimersRef.current.set(nodeId, timer)
+  const clearResyncTimer = useCallback(() => {
+    if (resyncTimerRef.current != null) {
+      window.clearTimeout(resyncTimerRef.current)
+      resyncTimerRef.current = null
     }
   }, [])
 
-  const applyTraceEvent = useCallback(
-    (event: TraceEvent) => {
-      setAgentGraph((current) => reduceAgentGraphOnTraceEvent(current, event))
-
-      const flashTargets = getFlashResetTargets(event)
-      if (flashTargets.length > 0) {
-        scheduleFlashReset(flashTargets)
-      }
+  const scheduleResync = useCallback(
+    (delayMs: number) => {
+      clearResyncTimer()
+      resyncTimerRef.current = window.setTimeout(() => {
+        resyncTimerRef.current = null
+        setAgentGraph((display) => {
+          const { graph, resyncs } = smoothGraphDisplay(
+            display,
+            logicalGraphRef.current,
+            smoothingClockRef.current
+          )
+          const nextDelay = minResyncDelay(resyncs)
+          if (nextDelay != null) {
+            scheduleResync(nextDelay)
+          }
+          return graph
+        })
+      }, delayMs)
     },
-    [scheduleFlashReset]
+    [clearResyncTimer]
   )
 
-  const clearFlashTimers = useCallback(() => {
-    flashTimersRef.current.forEach((timer) => window.clearTimeout(timer))
-    flashTimersRef.current.clear()
-  }, [])
+  const syncDisplayFromLogical = useCallback(
+    (display: typeof agentGraph) => {
+      const { graph, resyncs } = smoothGraphDisplay(
+        display,
+        logicalGraphRef.current,
+        smoothingClockRef.current
+      )
+      const delay = minResyncDelay(resyncs)
+      if (delay != null) {
+        scheduleResync(delay)
+      }
+      return graph
+    },
+    [scheduleResync]
+  )
+
+  const applyTraceEvent = useCallback(
+    (event: TraceEvent) => {
+      logicalGraphRef.current = reduceAgentGraphOnTraceEvent(
+        logicalGraphRef.current,
+        event
+      )
+      setAgentGraph((display) => syncDisplayFromLogical(display))
+    },
+    [syncDisplayFromLogical]
+  )
+
+  const clearSmoothing = useCallback(() => {
+    clearResyncTimer()
+    smoothingClockRef.current = createGraphSmoothingClock()
+  }, [clearResyncTimer])
 
   const resetGraph = useCallback(() => {
-    clearFlashTimers()
+    clearSmoothing()
+    logicalGraphRef.current = createInitialAgentGraphState()
     setAgentGraph(createInitialAgentGraphState())
-  }, [clearFlashTimers])
+  }, [clearSmoothing])
 
   const connectTrace = useCallback(
     (sid: string) => {
       abortRef.current?.abort()
 
-      sessionRef.current = sid
       const controller = new AbortController()
       abortRef.current = controller
 
@@ -107,8 +117,9 @@ export function useAgentTrace(sessionId: string | null) {
       replayAbortRef.current = true
       abortRef.current?.abort()
 
-      clearFlashTimers()
-      resetGraph()
+      clearSmoothing()
+      logicalGraphRef.current = createInitialAgentGraphState()
+      setAgentGraph(createInitialAgentGraphState())
 
       try {
         const events = await fetchTraceReplay(sid)
@@ -127,14 +138,13 @@ export function useAgentTrace(sessionId: string | null) {
         }
       }
     },
-    [applyTraceEvent, clearFlashTimers, connectTrace, resetGraph]
+    [applyTraceEvent, clearSmoothing, connectTrace]
   )
 
   useEffect(() => {
     if (!sessionId) {
       abortRef.current?.abort()
       abortRef.current = null
-      sessionRef.current = null
       return
     }
 
@@ -143,9 +153,9 @@ export function useAgentTrace(sessionId: string | null) {
     return () => {
       abortRef.current?.abort()
       replayAbortRef.current = true
-      clearFlashTimers()
+      clearSmoothing()
     }
-  }, [sessionId, clearFlashTimers, connectTrace])
+  }, [sessionId, clearSmoothing, connectTrace])
 
   return {
     agentGraph,
