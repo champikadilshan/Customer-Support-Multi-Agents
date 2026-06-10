@@ -22,7 +22,7 @@ from shared.agent_loop import run_agent_loop, _sse, _extract_text
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-llm = get_vertex_llm(temperature=0)
+llm = get_vertex_llm(temperature=0, role="orchestrator")
 
 
 class ChatRequest(BaseModel):

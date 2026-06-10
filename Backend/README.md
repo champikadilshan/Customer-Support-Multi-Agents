@@ -10,7 +10,11 @@ Required `.env` values:
 - `GOOGLE_CLOUD_PROJECT`
 - `GOOGLE_CLOUD_LOCATION`
 - `GOOGLE_APPLICATION_CREDENTIALS`
-- `GEMINI_MODEL`
+
+Optional model overrides (defaults: Pro orchestrator, Flash specialists):
+- `GEMINI_ORCHESTRATOR_MODEL` — intent detector / routing (default: `gemini-2.5-pro`)
+- `GEMINI_SPECIALIST_MODEL` — billing, complaint, sales agents (default: `gemini-2.5-flash`)
+- `GEMINI_MODEL` — fallback when no role is specified
 
 Run each service in a separate terminal from the `Backend` directory.
 

@@ -44,7 +44,7 @@ _call_billing_agent_tool = make_agent_call_tool(
     ),
 )
 
-llm       = get_vertex_llm(temperature=0)
+llm       = get_vertex_llm(temperature=0, role="specialist")
 mcp_tools: list = []
 
 _TICKET_PATTERNS = _re.compile(
