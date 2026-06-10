@@ -134,15 +134,19 @@ def _make_dispatch_tool(agent_type: AgentType, tool_name: str, description: str)
 
         if hitl_data:
             if session_id:
+                full_payload = {
+                    "hitl_pending":   True,
+                    "request_id":     request_id,
+                    "question":       hitl_data.get("question", ""),
+                    "ticket_preview": hitl_data.get("ticket_preview", {}),
+                    "options":        hitl_data.get("options", ["Yes", "No"]),
+                }
                 session_store.set_metadata(session_id, "hitl_pending_request_id", request_id)
                 session_store.set_metadata(session_id, "hitl_agent_url", agent_url.rstrip("/"))
-            return json.dumps({
-                "hitl_pending":   True,
-                "request_id":     request_id,
-                "question":       hitl_data.get("question", ""),
-                "ticket_preview": hitl_data.get("ticket_preview", {}),
-                "options":        hitl_data.get("options", ["Yes", "No"]),
-            })
+                # Store the full payload so stream_from_orchestrator can emit
+                # the proper event:hitl_request without re-parsing tool output
+                session_store.set_metadata(session_id, "hitl_pending_data", full_payload)
+            return json.dumps(full_payload)
 
         return "".join(collected) or f"[{agent_type.value} agent returned no response]"
 
@@ -225,6 +229,10 @@ async def stream_from_orchestrator(
 
     session_store.append_messages(sid, [{"type": "human", "content": user_message}])
 
+    # Clear stale HITL state from any previous turn
+    session_store.set_metadata(sid, "hitl_pending_data", None)
+    session_store.set_metadata(sid, "hitl_pending_request_id", None)
+
     # Emit session ID to the client first
     yield f"event: session\ndata: {json.dumps({'session_id': sid})}\n\n"
 
@@ -249,7 +257,6 @@ async def stream_from_orchestrator(
     trace_emitter.emit(sid, "orchestrator_dispatch", user_message=user_message[:120])
 
     collected_tokens: list[str] = []
-    hitl_data:        dict      = {}
 
     async for raw in stream_agent_events(
         agent=agent,
@@ -258,32 +265,61 @@ async def stream_from_orchestrator(
         session_id=sid,
         is_internal=False,
     ):
-        # Scan each data line for hitl_pending coming back from the dispatch tool
+        # Scan every data line BEFORE yielding to the client.
+        # If the dispatch tool returned hitl_pending JSON, it will appear as
+        # an event:hitl_request sentinel from stream_agent_events (because
+        # stream_agent_events intercepts state.next after the tools node).
+        # We must NOT yield that raw chunk — instead emit the frontend contract.
+        is_hitl = False
         for line in raw.splitlines():
             line = line.strip()
+            if line.startswith("event:") and "hitl_request" in line:
+                is_hitl = True
+                break
             if not line.startswith("data:"):
                 continue
             try:
                 payload = json.loads(line[5:].strip())
                 if payload.get("text"):
-                    collected_tokens.append(payload["text"])
-                # hitl_pending arrives as JSON inside a tool result token
-                if payload.get("hitl_pending"):
-                    hitl_data = payload
+                    # Guard: never forward hitl_pending JSON as chat text
+                    text = payload["text"]
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict) and parsed.get("hitl_pending"):
+                            # This is the dispatch tool return value leaking —
+                            # suppress it and emit hitl_request instead
+                            rid = session_store.get_metadata(sid, "hitl_pending_request_id")
+                            ai_text = "".join(collected_tokens)
+                            if ai_text:
+                                session_store.append_messages(sid, [{"type": "ai", "content": ai_text}])
+                            yield f"event: hitl_request\ndata: {json.dumps({**parsed, 'request_id': rid})}\n\n"
+                            return
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    collected_tokens.append(text)
             except json.JSONDecodeError:
                 pass
+
+        if is_hitl:
+            # stream_agent_events detected interrupt_before pause (state.next set).
+            # Read the real hitl_pending data that the dispatch tool stored in session.
+            rid = session_store.get_metadata(sid, "hitl_pending_request_id")
+            # Get the ticket preview from the complaint agent's session store metadata
+            # which was set by the dispatch tool when it received hitl_pending
+            hitl_meta = session_store.get_metadata(sid, "hitl_agent_url")
+            # Re-fetch the pending hitl data stored by the dispatch tool
+            pending = session_store.get_metadata(sid, "hitl_pending_data") or {}
+            ai_text = "".join(collected_tokens)
+            if ai_text:
+                session_store.append_messages(sid, [{"type": "ai", "content": ai_text}])
+            yield f"event: hitl_request\ndata: {json.dumps({**pending, 'request_id': rid})}\n\n"
+            return
 
         yield raw
 
     ai_text = "".join(collected_tokens)
     if ai_text:
         session_store.append_messages(sid, [{"type": "ai", "content": ai_text}])
-
-    # Relay HITL to the client with the complaint agent's request_id so the
-    # client can POST directly to complaint agent /process/resume
-    if hitl_data:
-        rid = session_store.get_metadata(sid, "hitl_pending_request_id")
-        yield f"event: hitl_request\ndata: {json.dumps({**hitl_data, 'request_id': rid})}\n\n"
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -348,9 +384,15 @@ async def chat(payload: ChatRequest) -> dict:
             try:
                 p = json.loads(line[5:].strip())
                 if p.get("text"):
-                    collected_tokens.append(p["text"])
-                if p.get("ticket_preview") or p.get("hitl_pending"):
-                    hitl_data = p
+                    # Never store hitl_pending JSON as chat text
+                    text = p["text"]
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict) and parsed.get("hitl_pending"):
+                            continue   # skip — will be returned as hitl fields below
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    collected_tokens.append(text)
             except json.JSONDecodeError:
                 pass
 
@@ -359,6 +401,9 @@ async def chat(payload: ChatRequest) -> dict:
         session_store.append_messages(sid, [{"type": "ai", "content": final_text}])
 
     result: dict = {"session_id": sid, "response": final_text}
+
+    # Use the structured payload stored by the dispatch tool — never re-parse tokens
+    hitl_data = session_store.get_metadata(sid, "hitl_pending_data") or {}
     if hitl_data:
         rid = session_store.get_metadata(sid, "hitl_pending_request_id")
         result.update({

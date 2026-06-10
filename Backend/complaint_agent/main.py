@@ -200,19 +200,28 @@ OWN_TOOLS = [
     categorize_complaint, create_ticket,
 ]
 
+# Sentinel used to signal "resume from interrupt_before pause" inside the
+# stream loop. interrupt_before resumes by passing None to astream(), NOT
+# via Command(resume=...) which is for langgraph.types.interrupt() pauses.
+_RESUME = object()
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a compassionate and professional complaint resolution agent for a telecommunications company.
 
 CONVERSATION BEHAVIOUR:
 1. Greet the user warmly on the first message. Continue naturally on subsequent turns.
-2. Acknowledge the customer's frustration with one empathetic sentence before taking action.
-3. Before raising a ticket ensure you have a clear complaint description and the customer's ID.
-   Ask ONE clarifying question at a time. Never re-ask for information already given.
-4. When ready to raise a ticket:
-   a. Call categorize_complaint to get category and priority.
-   b. Call create_ticket with those details.
-   The system will automatically pause and ask the customer to confirm.
+2. Acknowledge the customer's frustration with ONE short empathetic sentence.
+3. You need two things before raising a ticket: a complaint description AND a customer ID.
+   - If BOTH are already present in the message, DO NOT ask for anything — proceed immediately
+     to step 4. The customer has already given you everything you need.
+   - If one is missing, ask for it with a single question.
+   - Never re-ask for information already provided.
+4. When you have both the complaint description and the customer ID, act immediately:
+   a. Call categorize_complaint with the complaint description.
+   b. In the SAME response, call create_ticket using the category and priority from step (a).
+   Do NOT announce what you are doing. Do NOT ask for confirmation first — the system
+   will automatically pause and ask the customer to confirm before the ticket is saved.
 5. For history lookups or status checks use get_complaint_history or get_ticket_status.
 6. Never expose raw JSON — translate everything into friendly language.
 7. Close warmly if the customer says goodbye.
@@ -325,46 +334,98 @@ async def stream_complaint_agent(req: A2ARequest) -> AsyncIterator[str]:
 
     agent    = _build_agent(req, session_id)
     messages = _build_messages(req)
+    config   = {"configurable": {"thread_id": session_id}}
 
-    hitl_triggered = False
+    # interrupt_before=["tools"] fires before EVERY tool call, including
+    # categorize_complaint.  We loop: auto-resume any interrupt that is NOT
+    # create_ticket, and only surface the HITL event when it IS create_ticket.
+    #
+    # First iteration: pass the raw messages list.
+    # Subsequent iterations (auto-resume): pass Command(resume=None).
+    current_input = messages   # list[dict] — stream_agent_events wraps it
 
-    async for chunk in stream_agent_events(
-        agent=agent,
-        messages=messages,
-        agent_name="complaint",
-        session_id=session_id,
-        is_internal=req.is_internal,
-    ):
-        # Intercept hitl_request events to enrich with ticket preview
-        # from the checkpointed state — this is the graph's own public state,
-        # not an internal structure inspection.
-        if "hitl_request" in chunk and not hitl_triggered:
-            hitl_triggered = True
-            args = _get_pending_tool_call(agent, session_id)
-            if args:
-                title    = args.get("title",    "Support Ticket")
-                category = args.get("category", "N/A")
-                priority = args.get("priority", "N/A")
-                payload  = {
-                    "question": (
-                        f"I'd like to raise a support ticket on your behalf:\n\n"
-                        f"  Title:    {title}\n"
-                        f"  Category: {category}\n"
-                        f"  Priority: {priority}\n\n"
-                        f"Shall I go ahead and create it?"
-                    ),
-                    "ticket_preview": {
+    while True:
+        hitl_triggered = False
+
+        async for chunk in stream_agent_events(
+            agent=agent,
+            messages=current_input,
+            agent_name="complaint",
+            session_id=session_id,
+            is_internal=req.is_internal,
+        ):
+            if "hitl_request" in chunk and not hitl_triggered:
+                # Check which tool is actually pending
+                args = _get_pending_tool_call(agent, session_id)
+                if args:
+                    # It IS create_ticket — surface HITL to the user and stop.
+                    hitl_triggered = True
+                    title    = args.get("title",    "Support Ticket")
+                    category = args.get("category", "N/A")
+                    priority = args.get("priority", "N/A")
+                    ticket_preview = {
                         "title":       title,
                         "description": args.get("description", ""),
                         "customer_id": args.get("customer_id"),
                         "category":    category,
                         "priority":    priority,
-                    },
-                    "options": ["Yes, raise it", "No, skip it"],
-                }
-                yield f"event: hitl_request\ndata: {json.dumps(payload)}\n\n"
-                return
-        yield chunk
+                    }
+
+                    # Exact trace sequence the frontend diagram expects:
+                    #
+                    # 1. tool_end(create_ticket) — clears Ticket Service RUNNING → IDLE
+                    #    The tool was never executed (interrupt_before paused before it),
+                    #    but tool_start was already emitted by stream_agent_events, so
+                    #    we must close it or Ticket Service stays RUNNING alongside Human Review.
+                    #
+                    # 2. hitl_requested — frontend moves highlight to Human Review node
+                    #
+                    # 3. agent_end(hitl_suspended) — keeps Human Review in WAITING state
+                    #    until the user responds via /process/resume
+                    trace_emitter.emit(
+                        session_id, "tool_end",
+                        agent="complaint",
+                        tool="create_ticket",
+                    )
+                    trace_emitter.emit(
+                        session_id, "hitl_requested",
+                        agent="complaint",
+                        ticket_preview=ticket_preview,
+                    )
+                    trace_emitter.emit(
+                        session_id, "agent_end",
+                        agent="complaint",
+                        status="hitl_suspended",
+                        is_internal=False,
+                    )
+
+                    payload = {
+                        "question": (
+                            f"I'd like to raise a support ticket on your behalf:\n\n"
+                            f"  Title:    {title}\n"
+                            f"  Category: {category}\n"
+                            f"  Priority: {priority}\n\n"
+                            f"Shall I go ahead and create it?"
+                        ),
+                        "ticket_preview": ticket_preview,
+                        "options": ["Yes, raise it", "No, skip it"],
+                    }
+                    yield f"event: hitl_request\ndata: {json.dumps(payload)}\n\n"
+                    return
+                else:
+                    # Not create_ticket — this is categorize_complaint or similar.
+                    # Auto-resume: break inner loop and re-enter with Command(resume=None)
+                    break
+            else:
+                yield chunk
+        else:
+            # Inner for-loop completed normally (no break) — agent finished
+            break
+
+        # We broke out because of a non-create_ticket interrupt — auto-resume.
+        # For interrupt_before graphs, resume by passing None directly to astream().
+        # Command(resume=...) is only for langgraph.types.interrupt() function pauses.
+        current_input = _RESUME
 
 
 async def stream_complaint_resume(
@@ -392,32 +453,36 @@ async def stream_complaint_resume(
     agent  = _build_agent(req_placeholder, session_id)
     config = {"configurable": {"thread_id": session_id}}
 
+    # Emit agent_start so the frontend diagram shows complaint node going RUNNING again
+    trace_emitter.emit(
+        session_id, "agent_start",
+        agent="complaint",
+        is_internal=False,
+        triggered_by="hitl_resume",
+    )
+
     if confirmed:
-        # Resume — let the tools node execute normally
-        resume_cmd = Command(resume=None)
+        # Resume — pass None to astream(); this tells interrupt_before to proceed.
+        pass
     else:
-        # Reject — update graph state to clear pending tool calls,
-        # then resume so the model can respond gracefully
+        # Reject — clear the pending tool_calls from the last AIMessage so the
+        # model sees no pending action and responds with a cancellation message.
         state = agent.get_state(config)
-        messages = list(state.values.get("messages", []))
-        if messages:
-            last_msg = messages[-1]
+        msgs = list(state.values.get("messages", []))
+        if msgs:
+            last_msg = msgs[-1]
             if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                # Replace tool_calls with empty list so the model
-                # treats it as a normal turn with no pending action
                 from langchain_core.messages import AIMessage
-                messages[-1] = AIMessage(
+                msgs[-1] = AIMessage(
                     content="The customer declined to raise a ticket.",
                     tool_calls=[],
                 )
-                agent.update_state(config, {"messages": messages})
-        resume_cmd = Command(resume=None)
+                agent.update_state(config, {"messages": msgs})
 
     async for chunk in resume_agent(
         agent=agent,
         session_id=session_id,
         agent_name="complaint",
-        resume_value=resume_cmd.resume,
     ):
         yield chunk
 
