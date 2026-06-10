@@ -44,11 +44,10 @@ def make_agent_call_tool(target: AgentType,description: str,) -> Callable:
             source_agent=AgentType(calling_agent),
             target_agent=target,
             user_message=task,
-            context={
-                "is_internal":    True,
-                "calling_agent":  calling_agent,
-            },
+            context={"session_id": session_id},
             conversation_history=history,
+            is_internal=True,
+            calling_agent=calling_agent,
         )
 
         url        = AGENT_URLS[target]

@@ -184,6 +184,53 @@ function completeToolInfra(state: AgentGraphState, tool: string): AgentGraphStat
   return next
 }
 
+const SPECIALIST_AGENTS: AgentNodeId[] = ["billing", "complaint", "sales"]
+
+function isOrchestratorRef(agent: string | undefined): boolean {
+  if (!agent) return false
+  const normalized = agent.toLowerCase()
+  return normalized.includes("orchestrator") || normalized.includes("intent")
+}
+
+/** True when an agent was invoked by another specialist (A2A), not by the orchestrator. */
+function isSubAgentTriggered(event: TraceEvent): boolean {
+  if (event.is_internal) return true
+  const parentId = mapTraceAgent(event.triggered_by)
+  return parentId != null && parentId !== "intent_detector"
+}
+
+function ensureOrchestratorRouteTo(
+  state: AgentGraphState,
+  primaryAgent: AgentNodeId,
+  status: EdgeStatus = "active"
+): AgentGraphState {
+  let next = setEdge(state, "intent_detector", primaryAgent, status)
+  for (const specialist of SPECIALIST_AGENTS) {
+    if (specialist !== primaryAgent) {
+      next = setEdge(next, "intent_detector", specialist, "idle")
+    }
+  }
+  return next
+}
+
+/** Active specialist→specialist handoff targeting `targetAgent`, if any. */
+function getActiveHandoffParent(
+  state: AgentGraphState,
+  targetAgent: AgentNodeId
+): AgentNodeId | null {
+  for (const handoff of state.handoffs) {
+    if (handoff.status !== "active") continue
+    const toId = mapTraceAgent(handoff.to)
+    if (toId !== targetAgent) continue
+    const fromId = mapTraceAgent(handoff.from)
+    if (!fromId || fromId === "intent_detector" || fromId === targetAgent) {
+      continue
+    }
+    return fromId
+  }
+  return null
+}
+
 function activatePrimaryRoute(
   state: AgentGraphState,
   agentId: AgentNodeId,
@@ -191,19 +238,11 @@ function activatePrimaryRoute(
 ): AgentGraphState {
   let next = setNode(state, "intent_detector", "active", "Dispatching...")
   next = setNode(next, agentId, "active", detail)
-  next = setEdge(next, "intent_detector", agentId, "active")
-  next = {
+  next = ensureOrchestratorRouteTo(next, agentId, "active")
+  return {
     ...next,
     routedAgent: agentId,
   }
-
-  for (const specialist of ["billing", "complaint", "sales"] as AgentNodeId[]) {
-    if (specialist !== agentId) {
-      next = setEdge(next, "intent_detector", specialist, "idle")
-    }
-  }
-
-  return next
 }
 
 function resolveHighlightNode(event: TraceEvent): AgentNodeId | undefined {
@@ -287,33 +326,58 @@ export function reduceAgentGraphOnTraceEvent(
       const agentId = mapTraceAgent(event.agent)
       if (!agentId || agentId === "intent_detector") break
 
-      if (!event.is_internal) {
+      const parentId = mapTraceAgent(event.triggered_by)
+      const handoffParent = getActiveHandoffParent(next, agentId)
+      const isSubAgentCall =
+        isSubAgentTriggered(event) || handoffParent != null
+
+      // Backend may emit a second agent_start with triggered_by=orchestrator
+      // after an A2A handoff already activated this node.
+      if (
+        handoffParent &&
+        !isSubAgentTriggered(event) &&
+        next.nodes[agentId].status === "active" &&
+        next.nodes[agentId].detail?.includes("Internal call")
+      ) {
+        break
+      }
+
+      const effectiveParent =
+        parentId && parentId !== "intent_detector" && parentId !== agentId
+          ? parentId
+          : handoffParent
+
+      if (!isSubAgentCall) {
         if (next.routedAgent !== agentId) {
           next = activatePrimaryRoute(next, agentId, "Handling request...")
         } else {
           next = setNode(next, agentId, "active", "Handling request...")
-          next = setEdge(next, "intent_detector", agentId, "active")
+          next = ensureOrchestratorRouteTo(next, agentId, "active")
         }
       } else {
-        const parentId = mapTraceAgent(event.triggered_by)
-        if (parentId && parentId !== agentId) {
+        if (effectiveParent && effectiveParent !== agentId) {
           next = setNode(
             next,
-            parentId,
+            effectiveParent,
             "active",
             `Waiting on ${event.agent ?? "agent"}...`
           )
-          next = setEdge(next, parentId, agentId, "active")
+          next = setEdge(next, effectiveParent, agentId, "active")
+          if (next.routedAgent) {
+            next = ensureOrchestratorRouteTo(next, next.routedAgent, "active")
+            next = setEdge(next, "intent_detector", agentId, "idle")
+          }
         }
+        const callerLabel = effectiveParent ?? event.triggered_by ?? "agent"
         next = setNode(
           next,
           agentId,
           "active",
-          `Internal call from ${event.triggered_by ?? "agent"}`
+          `Internal call from ${callerLabel}`
         )
         next = upsertHandoff(
           next,
-          event.triggered_by ?? "unknown",
+          String(callerLabel),
           event.agent ?? "unknown",
           "active",
           "Internal agent call"
@@ -347,20 +411,23 @@ export function reduceAgentGraphOnTraceEvent(
         })
       }
 
-      if (event.is_internal && event.triggered_by) {
+      const subAgentCall = isSubAgentTriggered(event)
+
+      if (subAgentCall && event.triggered_by) {
         next = upsertHandoff(
           next,
           event.triggered_by,
           event.agent ?? "unknown",
           "completed"
         )
-        const parentId = mapTraceAgent(event.triggered_by)
-        if (parentId) {
-          next = setEdge(next, parentId, agentId, "completed")
+        const callerId = mapTraceAgent(event.triggered_by)
+        if (callerId) {
+          next = setEdge(next, callerId, agentId, "completed")
+          next = setNode(next, callerId, "active", "Resuming...")
         }
       }
 
-      if (next.routedAgent === agentId && !event.is_internal) {
+      if (next.routedAgent === agentId && !subAgentCall) {
         next = setEdge(next, "intent_detector", agentId, "completed")
       }
       break
@@ -369,6 +436,8 @@ export function reduceAgentGraphOnTraceEvent(
     case "agent_handoff": {
       const fromId = mapTraceAgent(event.from_agent)
       const toId = mapTraceAgent(event.to_agent)
+      const fromOrchestrator =
+        fromId === "intent_detector" || isOrchestratorRef(event.from_agent)
 
       next = upsertHandoff(
         next,
@@ -380,12 +449,38 @@ export function reduceAgentGraphOnTraceEvent(
 
       if (fromId && toId) {
         next = setEdge(next, fromId, toId, "active")
+
         if (toId !== "intent_detector") {
-          next = setNode(next, toId, "active", event.reason ?? "Handoff in progress...")
-          next = { ...next, routedAgent: toId }
+          next = setNode(
+            next,
+            toId,
+            "active",
+            event.reason ?? "Handoff in progress..."
+          )
+
+          if (fromOrchestrator) {
+            next = { ...next, routedAgent: toId }
+            next = ensureOrchestratorRouteTo(next, toId, "active")
+          }
         }
-        if (fromId) {
-          next = setNode(next, fromId, "active", `Handoff to ${event.to_agent}...`)
+
+        if (fromOrchestrator) {
+          next = setNode(
+            next,
+            fromId,
+            "active",
+            `Dispatching to ${event.to_agent}...`
+          )
+        } else if (fromId) {
+          next = setNode(
+            next,
+            fromId,
+            "active",
+            `Waiting on ${event.to_agent ?? "agent"}...`
+          )
+          if (next.routedAgent && toId !== next.routedAgent) {
+            next = setEdge(next, "intent_detector", toId, "idle")
+          }
         }
       }
       break

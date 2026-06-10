@@ -142,6 +142,8 @@ function TraceEdgeComponent({
   }
 
   const idleDasharray = isCollab ? "6 6" : undefined
+  const activeDasharray = isCollab ? "8 6" : "10 8"
+  const dashOffset = isCollab ? "-28" : "-36"
 
   return (
     <g opacity={opacity}>
@@ -151,27 +153,38 @@ function TraceEdgeComponent({
           d={segment.d}
           fill="none"
           stroke={stroke}
-          strokeWidth={isActive ? 3 : isCollab ? 1.75 : 2}
-          strokeDasharray={isActive && !isCollab ? "10 8" : idleDasharray}
+          strokeWidth={isActive ? (isCollab ? 2.5 : 3) : isCollab ? 1.75 : 2}
+          strokeDasharray={isActive ? activeDasharray : idleDasharray}
           strokeLinecap="round"
           className="transition-[stroke,stroke-width,opacity] duration-300 ease-out"
         >
-          {isActive && !isCollab && segment.key === "full" ? (
+          {isActive ? (
             <animate
               attributeName="stroke-dashoffset"
               from="0"
-              to="-36"
+              to={dashOffset}
               dur="0.8s"
               repeatCount="indefinite"
             />
           ) : null}
         </path>
       ))}
-      {isActive && !isCollab ? (
-        <circle r="4" fill={stroke} pointerEvents="none">
-          <animateMotion dur="0.8s" repeatCount="indefinite" path={path} />
-        </circle>
-      ) : null}
+      {isActive
+        ? paths.map((segment) => (
+            <circle
+              key={`${id}-flow-${segment.key}`}
+              r={isCollab ? 3.5 : 4}
+              fill={stroke}
+              pointerEvents="none"
+            >
+              <animateMotion
+                dur="0.8s"
+                repeatCount="indefinite"
+                path={segment.d}
+              />
+            </circle>
+          ))
+        : null}
     </g>
   )
 }
