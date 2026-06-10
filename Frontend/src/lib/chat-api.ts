@@ -29,10 +29,7 @@ export class ChatApiError extends Error {
   }
 }
 
-export async function postChat(
-  message: string,
-  sessionId: string | null
-): Promise<ChatResponse> {
+export async function postChat(message: string,sessionId: string | null): Promise<ChatResponse> {
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
