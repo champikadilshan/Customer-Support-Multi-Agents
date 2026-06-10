@@ -107,6 +107,7 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
   onHitlRespond,
 }) => {
   const isUser = role === "user"
+  const isSystem = role === "system"
   const hasActiveToolCall = toolInvocations?.some(
     (invocation) => invocation.state === "call"
   )
@@ -143,6 +144,16 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
     }
 
     return null
+  }
+
+  if (isSystem) {
+    return (
+      <div className="flex justify-center px-2">
+        <p className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-center text-xs leading-relaxed text-muted-foreground">
+          {content}
+        </p>
+      </div>
+    )
   }
 
   if (isUser) {

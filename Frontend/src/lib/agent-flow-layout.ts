@@ -22,7 +22,7 @@ export type StaticEdge = {
  */
 export const CANVAS = {
   width: 1040,
-  height: 400,
+  height: 492,
 }
 
 const COL = {
@@ -36,26 +36,33 @@ const NODE_W = 210
 const NODE_H_AGENT = 86
 const NODE_H_INFRA = 78
 
+/** Shared vertical gap between graph tiers (orchestrator → agents → infra). */
+const ROW_GAP = 56
+const ORCHESTRATOR_H = 82
+const AGENT_ROW_Y = ORCHESTRATOR_H + ROW_GAP
+const INFRA_ROW_Y = AGENT_ROW_Y + NODE_H_AGENT + ROW_GAP
+const DEEP_INFRA_ROW_Y = INFRA_ROW_Y + NODE_H_INFRA + ROW_GAP
+
 export const NODE_LAYOUT: Record<AgentNodeId, NodeLayout> = {
   intent_detector: {
     x: (CANVAS.width - 230) / 2,
     y: 0,
     w: 230,
-    h: 82,
+    h: ORCHESTRATOR_H,
   },
 
-  billing: { x: COL.billing, y: 100, w: NODE_W, h: NODE_H_AGENT },
-  complaint: { x: COL.complaint, y: 100, w: NODE_W, h: NODE_H_AGENT },
-  sales: { x: COL.sales, y: 100, w: NODE_W, h: NODE_H_AGENT },
+  billing: { x: COL.billing, y: AGENT_ROW_Y, w: NODE_W, h: NODE_H_AGENT },
+  complaint: { x: COL.complaint, y: AGENT_ROW_Y, w: NODE_W, h: NODE_H_AGENT },
+  sales: { x: COL.sales, y: AGENT_ROW_Y, w: NODE_W, h: NODE_H_AGENT },
 
-  billing_db: { x: COL.billing, y: 218, w: NODE_W, h: NODE_H_INFRA },
+  billing_db: { x: COL.billing, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
 
-  ticket_api: { x: COL.complaint, y: 218, w: NODE_W, h: NODE_H_INFRA },
-  hitl: { x: COL.hitl, y: 218, w: NODE_W, h: NODE_H_INFRA },
-  ticket_db: { x: COL.complaint, y: 312, w: NODE_W, h: NODE_H_INFRA },
+  ticket_api: { x: COL.complaint, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
+  hitl: { x: COL.hitl, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
+  ticket_db: { x: COL.complaint, y: DEEP_INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
 
-  sales_mcp: { x: COL.sales, y: 218, w: NODE_W, h: NODE_H_INFRA },
-  product_db: { x: COL.sales, y: 312, w: NODE_W, h: NODE_H_INFRA },
+  sales_mcp: { x: COL.sales, y: INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
+  product_db: { x: COL.sales, y: DEEP_INFRA_ROW_Y, w: NODE_W, h: NODE_H_INFRA },
 }
 
 export const STATIC_EDGES: StaticEdge[] = [
@@ -138,30 +145,6 @@ export const STATIC_EDGES: StaticEdge[] = [
     sourceHandle: "source-left",
     targetHandle: "target-right",
     kind: "pipeline",
-  },
-  {
-    id: "collab-b-c",
-    from: "billing",
-    to: "complaint",
-    sourceHandle: "right",
-    targetHandle: "left",
-    kind: "collaboration",
-  },
-  {
-    id: "collab-c-s",
-    from: "complaint",
-    to: "sales",
-    sourceHandle: "right",
-    targetHandle: "left",
-    kind: "collaboration",
-  },
-  {
-    id: "collab-s-b",
-    from: "sales",
-    to: "billing",
-    sourceHandle: "source-left",
-    targetHandle: "target-right",
-    kind: "collaboration",
   },
 ]
 

@@ -173,7 +173,7 @@ def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
             history=req.conversation_history,
         )
         tools = [*OWN_TOOLS, bound_complaint]
-    return {t.name: t for t in tools}
+    return {t.name: t for t in tools if hasattr(t, "name") and t.name}
 
 
 def _make_llm_with_tools(req: A2ARequest, session_id: str):

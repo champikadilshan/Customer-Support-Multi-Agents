@@ -5,7 +5,7 @@ import { ArrowDown } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { useAutoScroll } from "@/hooks/use-auto-scroll"
-import { getAgentStatusMessage } from "@/lib/agent-status"
+import { formatAgentName } from "@/lib/agent-status"
 import { Button } from "@/components/ui/button"
 import { type Message } from "@/components/ui/chat-message"
 import { CopyButton } from "@/components/ui/copy-button"
@@ -22,7 +22,6 @@ interface ChatProps {
   isGenerating: boolean
   isHitlPending?: boolean
   activeAgent?: string | null
-  activeIntent?: string | null
   respondToHitl?: (messageId: string, response: "yes" | "no") => void
   stop?: () => void
 }
@@ -36,7 +35,6 @@ export function Chat({
   isGenerating,
   isHitlPending = false,
   activeAgent = null,
-  activeIntent = null,
   respondToHitl,
   className,
 }: ChatProps) {
@@ -60,11 +58,11 @@ export function Chat({
         ),
         isStreaming: isGenerating && isLastAssistant,
         enableTypewriter: Boolean(isLastAssistant && message.createdAt),
-        statusMessage: getAgentStatusMessage({
-          activeAgent,
-          activeIntent,
-          hasActiveToolCall: Boolean(hasActiveToolCall),
-        }),
+        statusMessage: hasActiveToolCall
+          ? "Running tools in the background"
+          : activeAgent
+            ? `Connecting to ${formatAgentName(activeAgent)} specialist`
+            : "Analyzing your request",
         isHitlResponding:
           isGenerating && Boolean(message.hitlResponse && message.hitlRequest),
         animation:
@@ -77,11 +75,22 @@ export function Chat({
             : undefined,
       }
     },
-    [activeAgent, activeIntent, isGenerating, lastMessage?.id, respondToHitl]
+    [activeAgent, isGenerating, lastMessage?.id, respondToHitl]
   )
 
   return (
     <ChatContainer className={className}>
+      {activeAgent ? (
+        <div className="flex shrink-0 justify-center">
+          <span className="rounded-full border border-border/70 bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground">
+            Active agent:{" "}
+            <span className="font-medium text-foreground">
+              {formatAgentName(activeAgent)}
+            </span>
+          </span>
+        </div>
+      ) : null}
+
       {isEmpty ? <ChatEmptyState /> : null}
 
       {messages.length > 0 ? (

@@ -1,47 +1,124 @@
 "use client"
 
-import { useCallback, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { type Message } from "@/components/ui/chat-message"
-import { useAgentTrace, readStoredSessionId, SESSION_STORAGE_KEY } from "@/hooks/use-agent-trace"
+import { useAgentTrace } from "@/hooks/use-agent-trace"
 import { refreshTicketsPanel } from "@/hooks/use-tickets"
+import {
+  ChatApiError,
+  getSession,
+  postChat,
+} from "@/lib/chat-api"
+import {
+  hitlPendingToRequest,
+  type HitlPending,
+} from "@/lib/hitl"
+import {
+  clearStoredSessionId,
+  persistSessionId,
+  readStoredSessionId,
+} from "@/lib/session-storage"
 import { consumeSseStream, type SseEvent } from "@/lib/sse"
 
-export type { HitlRequest } from "@/lib/hitl"
+export type { HitlRequest, HitlPending } from "@/lib/hitl"
 
 function createId() {
   return crypto.randomUUID()
 }
 
-function persistSessionId(sessionId: string) {
-  localStorage.setItem(SESSION_STORAGE_KEY, sessionId)
+function createSystemMessage(content: string): Message {
+  return {
+    id: createId(),
+    role: "system",
+    content,
+    createdAt: new Date(),
+  }
 }
 
 export function useSupportChat() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
-  const [isGenerating, setIsGenerating] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
   const [isResetting, setIsResetting] = useState(false)
+  const [isRestoringSession, setIsRestoringSession] = useState(true)
   const [activeAgent, setActiveAgent] = useState<string | null>(null)
-  const [activeIntent, setActiveIntent] = useState<string | null>(null)
-  const [sessionId, setSessionId] = useState<string | null>(readStoredSessionId)
+  const [hitlPending, setHitlPending] = useState<HitlPending | null>(null)
+  const [sessionId, setSessionId] = useState<string | null>(null)
   const { agentGraph, resetGraph, connectTrace, replayTrace } = useAgentTrace(sessionId)
   const abortRef = useRef<AbortController | null>(null)
-  const assistantIdRef = useRef<string | null>(null)
+  const hitlMessageIdRef = useRef<string | null>(null)
 
-  const isHitlPending = useMemo(
-    () => messages.some((message) => message.hitlRequest && !message.hitlResponse),
-    [messages]
-  )
+  const isHitlPending = hitlPending !== null
 
   const isGraphLive = useMemo(() => {
-    if (isGenerating || isHitlPending) return true
-
+    if (isLoading || isHitlPending) return true
     return Object.values(agentGraph.nodes).some(
       (node) => node.status === "active" || node.status === "waiting"
     )
-  }, [agentGraph.nodes, isGenerating, isHitlPending])
+  }, [agentGraph.nodes, isHitlPending, isLoading])
+
+  const refreshActiveAgent = useCallback(async (sid: string) => {
+    try {
+      const info = await getSession(sid)
+      setActiveAgent(info.active_agent)
+    } catch {
+      // Non-fatal — badge stays as-is
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function restoreSession() {
+      const storedId = readStoredSessionId()
+      if (!storedId) {
+        setIsRestoringSession(false)
+        return
+      }
+
+      try {
+        const info = await getSession(storedId)
+        if (cancelled) return
+
+        setSessionId(storedId)
+        setActiveAgent(info.active_agent)
+        connectTrace(storedId)
+
+        const pendingRequestId = info.metadata?.hitl_pending_request_id
+        const ticketData = info.metadata?.hitl_ticket_data
+
+        if (
+          typeof pendingRequestId === "string" &&
+          ticketData &&
+          typeof ticketData === "object"
+        ) {
+          setHitlPending({
+            request_id: pendingRequestId,
+            ticket_preview: ticketData as HitlPending["ticket_preview"],
+            hitl_question:
+              "A ticket is awaiting your confirmation. Please choose an option below.",
+            hitl_options: ["Yes, raise it", "No, skip it"],
+          })
+        }
+      } catch (error) {
+        if (cancelled) return
+        if (error instanceof ChatApiError && error.status === 404) {
+          clearStoredSessionId()
+          setSessionId(null)
+        }
+      } finally {
+        if (!cancelled) setIsRestoringSession(false)
+      }
+    }
+
+    void restoreSession()
+
+    return () => {
+      cancelled = true
+    }
+  }, [connectTrace])
 
   const handleInputChange = useCallback(
     (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -53,179 +130,176 @@ export function useSupportChat() {
   const stop = useCallback(() => {
     abortRef.current?.abort()
     abortRef.current = null
-    setIsGenerating(false)
+    setIsLoading(false)
   }, [])
 
-  const clearLocalChatState = useCallback(() => {
-    setMessages([])
-    setInput("")
-    setActiveAgent(null)
-    setActiveIntent(null)
-    resetGraph()
-  }, [resetGraph])
+  const appendMessage = useCallback((message: Message) => {
+    setMessages((current) => [...current, message])
+  }, [])
 
-  const updateAssistantMessage = useCallback(
-    (assistantId: string, updater: (message: Message) => Message) => {
+  const updateMessage = useCallback(
+    (messageId: string, updater: (message: Message) => Message) => {
       setMessages((current) =>
         current.map((message) =>
-          message.id === assistantId ? updater(message) : message
+          message.id === messageId ? updater(message) : message
         )
       )
     },
     []
   )
 
-  const handleStreamEvent = useCallback(
+  const clearLocalChatState = useCallback(() => {
+    setMessages([])
+    setInput("")
+    setActiveAgent(null)
+    setHitlPending(null)
+    hitlMessageIdRef.current = null
+    setSessionId(null)
+    clearStoredSessionId()
+    resetGraph()
+  }, [resetGraph])
+
+  const handleResumeEvent = useCallback(
     (assistantId: string, event: SseEvent) => {
       switch (event.type) {
-        case "session": {
-          const sid = event.data.session_id
-          persistSessionId(sid)
-          setSessionId(sid)
-          connectTrace(sid)
-          break
-        }
-
-        case "intent":
-          setActiveIntent(event.data.intent)
-          setActiveAgent(event.data.agent)
+        case "token":
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content: message.content + event.data.text,
+          }))
           break
 
         case "tool_call":
-          updateAssistantMessage(assistantId, (message) => {
+          updateMessage(assistantId, (message) => {
             const existing = message.toolInvocations ?? []
-            const completed = existing.map((tool) =>
-              tool.state === "call"
-                ? {
-                    state: "result" as const,
-                    toolName: tool.toolName,
-                    result: { completed: true },
-                  }
-                : tool
-            )
-
             return {
               ...message,
               toolInvocations: [
-                ...completed,
+                ...existing,
                 { state: "call" as const, toolName: event.data.tool },
               ],
             }
           })
           break
 
-        case "token":
-          updateAssistantMessage(assistantId, (message) => ({
-            ...message,
-            content: message.content + event.data.text,
-          }))
-          break
-
-        case "hitl_request":
-          updateAssistantMessage(assistantId, (message) => ({
-            ...message,
-            hitlRequest: event.data,
-          }))
-          break
-
         case "error":
-          updateAssistantMessage(assistantId, (message) => ({
-            ...message,
-            content: message.content || event.data.message,
-          }))
+          appendMessage(
+            createSystemMessage(
+              event.data.message || "Something went wrong. Please try again."
+            )
+          )
+          setHitlPending(null)
+          hitlMessageIdRef.current = null
           break
 
         case "done":
-          updateAssistantMessage(assistantId, (message) => {
-            const completedTools = message.toolInvocations?.map((tool) =>
-              tool.state === "call"
-                ? {
-                    state: "result" as const,
-                    toolName: tool.toolName,
-                    result: { completed: true },
-                  }
-                : tool
-            )
-
-            return {
-              ...message,
-              toolInvocations: completedTools,
-            }
-          })
+          setHitlPending(null)
+          hitlMessageIdRef.current = null
           refreshTicketsPanel()
+          void refreshActiveAgent(sessionId ?? "")
           break
       }
     },
-    [connectTrace, updateAssistantMessage]
-  )
-
-  const streamMessage = useCallback(
-    async (message: string, url = "/api/chat/stream") => {
-      const userMessage: Message = {
-        id: createId(),
-        role: "user",
-        content: message,
-        createdAt: new Date(),
-      }
-
-      const assistantId = createId()
-      assistantIdRef.current = assistantId
-      const assistantMessage: Message = {
-        id: assistantId,
-        role: "assistant",
-        content: "",
-        createdAt: new Date(),
-        toolInvocations: [],
-      }
-
-      setMessages((current) => [...current, userMessage, assistantMessage])
-      setActiveAgent(null)
-      setActiveIntent(null)
-      setIsGenerating(true)
-
-      if (sessionId) {
-        connectTrace(sessionId)
-      }
-
-      const controller = new AbortController()
-      abortRef.current = controller
-
-      try {
-        await consumeSseStream(
-          url,
-          {
-            message,
-            session_id: sessionId,
-          },
-          (event) => handleStreamEvent(assistantId, event),
-          controller.signal
-        )
-      } catch (error) {
-        if ((error as Error).name !== "AbortError") {
-          updateAssistantMessage(assistantId, (current) => ({
-            ...current,
-            content:
-              current.content ||
-              "Something went wrong while contacting support. Please try again.",
-          }))
-        }
-      } finally {
-        abortRef.current = null
-        setIsGenerating(false)
-      }
-    },
-    [connectTrace, handleStreamEvent, sessionId, updateAssistantMessage]
+    [appendMessage, refreshActiveAgent, sessionId, updateMessage]
   )
 
   const sendMessage = useCallback(
     async (content: string) => {
       const trimmed = content.trim()
-      if (!trimmed || isGenerating || isHitlPending || isResetting) return
+      if (!trimmed || isLoading || isHitlPending || isResetting || isRestoringSession) {
+        return
+      }
 
+      const userMessage: Message = {
+        id: createId(),
+        role: "user",
+        content: trimmed,
+        createdAt: new Date(),
+      }
+
+      const assistantId = createId()
+      const loadingAssistant: Message = {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        createdAt: new Date(),
+      }
+
+      setMessages((current) => [...current, userMessage, loadingAssistant])
       setInput("")
-      await streamMessage(trimmed)
+      setIsLoading(true)
+
+      if (sessionId) {
+        connectTrace(sessionId)
+      }
+
+      try {
+        const data = await postChat(trimmed, sessionId)
+
+        persistSessionId(data.session_id)
+        setSessionId(data.session_id)
+        connectTrace(data.session_id)
+
+        if (data.hitl_pending && data.request_id) {
+          const pending: HitlPending = {
+            request_id: data.request_id,
+            ticket_preview: data.ticket_preview ?? {},
+            hitl_question: data.hitl_question ?? "Please confirm to continue.",
+            hitl_options: data.hitl_options ?? ["Yes, raise it", "No, skip it"],
+          }
+
+          setHitlPending(pending)
+          hitlMessageIdRef.current = assistantId
+
+          const assistantContent =
+            data.hitl_question?.trim() ||
+            data.response?.trim() ||
+            "Please review the ticket details below."
+
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content: assistantContent,
+            hitlRequest: hitlPendingToRequest(pending),
+          }))
+        } else {
+          updateMessage(assistantId, (message) => ({
+            ...message,
+            content:
+              data.response?.trim() ||
+              "I was unable to generate a response. Please try again.",
+          }))
+        }
+
+        void refreshActiveAgent(data.session_id)
+      } catch (error) {
+        setMessages((current) => current.filter((message) => message.id !== assistantId))
+
+        if (error instanceof ChatApiError) {
+          appendMessage(
+            createSystemMessage("Something went wrong. Please try again.")
+          )
+        } else {
+          appendMessage(
+            createSystemMessage(
+              "Connection lost. Please check your connection."
+            )
+          )
+        }
+      } finally {
+        setIsLoading(false)
+      }
     },
-    [isGenerating, isHitlPending, isResetting, streamMessage]
+    [
+      appendMessage,
+      connectTrace,
+      isHitlPending,
+      isLoading,
+      isResetting,
+      isRestoringSession,
+      refreshActiveAgent,
+      sessionId,
+      updateMessage,
+    ]
   )
 
   const handleSubmit = useCallback(
@@ -237,7 +311,7 @@ export function useSupportChat() {
   )
 
   const resetSession = useCallback(async () => {
-    if (isGenerating || isHitlPending || isResetting) return
+    if (isLoading || isHitlPending || isResetting) return
 
     stop()
     setIsResetting(true)
@@ -256,21 +330,19 @@ export function useSupportChat() {
       }
 
       clearLocalChatState()
-      toast.success("Chat session reset")
+      toast.success("New conversation started")
     } catch {
-      toast.error("Could not reset the chat session")
+      toast.error("Could not start a new conversation")
     } finally {
       setIsResetting(false)
     }
-  }, [clearLocalChatState, isGenerating, isHitlPending, isResetting, sessionId, stop])
+  }, [clearLocalChatState, isHitlPending, isLoading, isResetting, sessionId, stop])
 
   const respondToHitl = useCallback(
     async (messageId: string, response: "yes" | "no") => {
-      const targetMessage = messages.find((message) => message.id === messageId)
-      if (!targetMessage?.hitlRequest || targetMessage.hitlResponse) return
+      if (!hitlPending || isLoading) return
 
-      const requestId = targetMessage.hitlRequest.request_id
-      assistantIdRef.current = messageId
+      const requestId = hitlPending.request_id
 
       setMessages((current) =>
         current.map((message) =>
@@ -279,7 +351,17 @@ export function useSupportChat() {
             : message
         )
       )
-      setIsGenerating(true)
+
+      const resumeAssistantId = createId()
+      appendMessage({
+        id: resumeAssistantId,
+        role: "assistant",
+        content: "",
+        createdAt: new Date(),
+        toolInvocations: [],
+      })
+
+      setIsLoading(true)
 
       if (sessionId) {
         connectTrace(sessionId)
@@ -292,24 +374,32 @@ export function useSupportChat() {
         await consumeSseStream(
           "/api/chat/resume",
           { request_id: requestId, hitl_response: response },
-          (event) => handleStreamEvent(messageId, event),
+          (event) => handleResumeEvent(resumeAssistantId, event),
           controller.signal
         )
       } catch (error) {
         if ((error as Error).name !== "AbortError") {
-          updateAssistantMessage(messageId, (current) => ({
-            ...current,
-            content:
-              current.content ||
-              "Failed to resume the complaint flow. Please try your request again.",
-          }))
+          appendMessage(
+            createSystemMessage(
+              "Connection lost. Please check your connection."
+            )
+          )
+          setHitlPending(null)
+          hitlMessageIdRef.current = null
         }
       } finally {
         abortRef.current = null
-        setIsGenerating(false)
+        setIsLoading(false)
       }
     },
-    [connectTrace, handleStreamEvent, messages, sessionId, updateAssistantMessage]
+    [
+      appendMessage,
+      connectTrace,
+      handleResumeEvent,
+      hitlPending,
+      isLoading,
+      sessionId,
+    ]
   )
 
   return {
@@ -319,11 +409,13 @@ export function useSupportChat() {
     handleSubmit,
     stop,
     resetSession,
-    isGenerating,
+    isGenerating: isLoading,
+    isLoading,
     isResetting,
+    isRestoringSession,
     isHitlPending,
+    hitlPending,
     activeAgent,
-    activeIntent,
     respondToHitl,
     agentGraph,
     isGraphLive,

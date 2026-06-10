@@ -79,9 +79,18 @@
     display: none;
   }
 
+  .agent-flow-canvas .react-flow__edges {
+    z-index: 0;
+  }
+
+  .agent-flow-canvas .react-flow__nodes {
+    z-index: 1;
+  }
+
   .agent-flow-canvas .react-flow__node {
     pointer-events: none;
     overflow: visible;
+    z-index: 1;
   }
 
   .agent-flow-canvas .react-flow__node > div {

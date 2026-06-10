@@ -2,7 +2,6 @@
 
 import { memo } from "react"
 import {
-  BaseEdge,
   getSmoothStepPath,
   type EdgeProps,
 } from "@xyflow/react"
@@ -10,7 +9,6 @@ import {
 import type { TraceEdgeData } from "@/lib/agent-flow-elements"
 
 function TraceEdgeComponent({
-  id,
   sourceX,
   sourceY,
   targetX,
@@ -22,6 +20,8 @@ function TraceEdgeComponent({
   const kind = (data as TraceEdgeData | undefined)?.kind ?? "route"
   const status = (data as TraceEdgeData | undefined)?.status ?? "idle"
   const visible = (data as TraceEdgeData | undefined)?.visible !== false
+
+  if (!visible) return null
 
   const [path] = getSmoothStepPath({
     sourceX,
@@ -45,25 +45,33 @@ function TraceEdgeComponent({
     stroke = isData ? "rgba(5, 150, 105, 0.45)" : "hsl(var(--foreground) / 0.35)"
   }
 
-  const strokeDasharray =
+  const idleDasharray =
     kind === "collaboration" ? "6 6" : kind === "data" ? "4 5" : undefined
 
   return (
-    <g opacity={visible ? 1 : 0.28}>
-      <BaseEdge
-        id={id}
-        path={path}
-        style={{
-          stroke,
-          strokeWidth: isActive ? 3 : 2,
-          strokeDasharray,
-          strokeLinecap: "round",
-          transition: "stroke 0.35s ease, stroke-width 0.35s ease, opacity 0.35s ease",
-        }}
-      />
+    <g>
+      <path
+        d={path}
+        fill="none"
+        stroke={stroke}
+        strokeWidth={isActive ? 3 : 2}
+        strokeDasharray={isActive ? "10 8" : idleDasharray}
+        strokeLinecap="round"
+        className="transition-[stroke,stroke-width,opacity] duration-300 ease-out"
+      >
+        {isActive ? (
+          <animate
+            attributeName="stroke-dashoffset"
+            from="0"
+            to="-36"
+            dur="0.8s"
+            repeatCount="indefinite"
+          />
+        ) : null}
+      </path>
       {isActive ? (
-        <circle r="4" fill={stroke}>
-          <animateMotion dur="0.8s" repeatCount="1" path={path} />
+        <circle r="4" fill={stroke} pointerEvents="none">
+          <animateMotion dur="0.8s" repeatCount="indefinite" path={path} />
         </circle>
       ) : null}
     </g>

@@ -15,13 +15,7 @@ import {
   type TraceEvent,
 } from "@/lib/trace"
 
-const SESSION_STORAGE_KEY = "support-chat-session-id"
 const FLASH_RESET_MS = 1500
-
-function readStoredSessionId() {
-  if (typeof window === "undefined") return null
-  return localStorage.getItem(SESSION_STORAGE_KEY)
-}
 
 export function useAgentTrace(sessionId: string | null) {
   const [agentGraph, setAgentGraph] = useState(createInitialAgentGraphState)
@@ -161,4 +155,4 @@ export function useAgentTrace(sessionId: string | null) {
   }
 }
 
-export { SESSION_STORAGE_KEY, readStoredSessionId }
+export { SESSION_STORAGE_KEY, readStoredSessionId } from "@/lib/session-storage"

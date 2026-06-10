@@ -111,7 +111,7 @@ export function HitlConfirmationCard({
   return (
     <div
       className={cn(
-        "w-full max-w-md rounded-lg border border-border/60 bg-muted/50 p-4 duration-300 animate-in fade-in-0",
+        "w-full max-w-md rounded-lg border-2 border-amber-500/25 bg-muted/50 p-4 shadow-sm duration-300 animate-in fade-in-0",
         className
       )}
     >

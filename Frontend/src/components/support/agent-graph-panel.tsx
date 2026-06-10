@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
-import { Bot, Play } from "lucide-react"
+import { Bot, ChevronDown, ChevronUp, Play } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { type AgentGraphState, type AgentNodeId } from "@/lib/agent-graph"
@@ -86,15 +86,19 @@ export function AgentGraphPanel({
 }: AgentGraphPanelProps) {
   const [highlightNodeId, setHighlightNodeId] = useState<AgentNodeId | null>(null)
   const [isReplaying, setIsReplaying] = useState(false)
-  const logEndRef = useRef<HTMLDivElement>(null)
+  const [isEventLogOpen, setIsEventLogOpen] = useState(true)
+  const logScrollRef = useRef<HTMLDivElement>(null)
 
   const activeNodes = Object.values(graph.nodes).filter(
     (node) => node.status === "active" || node.status === "waiting"
   )
 
   useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }, [graph.activities.length])
+    if (!isEventLogOpen) return
+    const container = logScrollRef.current
+    if (!container) return
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" })
+  }, [graph.activities.length, isEventLogOpen])
 
   const handleReplay = async () => {
     if (!sessionId || !onReplay || isReplaying) return
@@ -162,67 +166,102 @@ export function AgentGraphPanel({
         </div>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
         <AgentFlowCanvas
           graph={graph}
           highlightNodeId={highlightNodeId}
-          className="min-h-[444px] flex-[3]"
+          className={cn(
+            "min-h-0 basis-0 transition-[flex-grow]",
+            isEventLogOpen ? "flex-[3]" : "flex-1"
+          )}
         />
 
-        <div className="flex min-h-0 shrink-0 flex-col rounded-xl border bg-background/70 flex-[2]">
-          <p className="shrink-0 border-b px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Event log
-          </p>
-          <div className="scrollbar-hidden h-[136px] shrink-0 overflow-y-auto p-2">
-            {graph.activities.length > 0 ? (
-              <ul className="space-y-1.5">
-                {graph.activities.map((activity) => (
-                  <li key={activity.id}>
-                    <button
-                      type="button"
-                      onClick={() => handleActivityClick(activity.highlightNodeId)}
-                      className={cn(
-                        "w-full rounded-md border border-border/60 bg-muted/30 px-2.5 py-1.5 text-left text-sm transition-colors",
-                        activity.highlightNodeId &&
-                          "hover:border-foreground/25 hover:bg-muted/50"
-                      )}
-                    >
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="font-mono text-[10px] text-muted-foreground">
-                          {formatActivityTime(activity.timestamp)}
-                        </span>
-                        {activity.eventType ? (
-                          <span
-                            className={cn(
-                              "rounded px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide",
-                              BADGE_STYLES[activity.eventType] ??
-                                "bg-muted text-muted-foreground"
-                            )}
-                          >
-                            {eventBadgeLabel(activity.eventType)}
-                          </span>
-                        ) : null}
-                        <span className="text-xs text-foreground">
-                          {activity.agent ?? activity.tool ?? activity.message}
-                          {activity.durationMs != null
-                            ? ` · ${activity.durationMs}ms`
-                            : null}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-muted-foreground">
-                        {activity.message}
-                      </p>
-                    </button>
-                  </li>
-                ))}
-                <div ref={logEndRef} />
-              </ul>
-            ) : (
-              <p className="px-1 text-xs leading-snug text-muted-foreground">
-                Trace events appear here as agents route, call tools, and hand off.
-              </p>
-            )}
+        <div
+          className={cn(
+            "flex flex-col overflow-hidden rounded-xl border bg-background/70 transition-all",
+            isEventLogOpen ? "min-h-0 flex-[2] basis-0" : "shrink-0"
+          )}
+        >
+          <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2">
+            <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              Event log
+              {!isEventLogOpen && graph.activities.length > 0 ? (
+                <span className="ml-1.5 font-normal normal-case text-muted-foreground/80">
+                  ({graph.activities.length})
+                </span>
+              ) : null}
+            </p>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 shrink-0 text-muted-foreground"
+              onClick={() => setIsEventLogOpen((open) => !open)}
+              aria-label={isEventLogOpen ? "Collapse event log" : "Expand event log"}
+              aria-expanded={isEventLogOpen}
+            >
+              {isEventLogOpen ? (
+                <ChevronDown className="h-4 w-4" />
+              ) : (
+                <ChevronUp className="h-4 w-4" />
+              )}
+            </Button>
           </div>
+
+          {isEventLogOpen ? (
+            <div
+              ref={logScrollRef}
+              className="scrollbar-hidden min-h-0 flex-1 overflow-y-auto p-2"
+            >
+              {graph.activities.length > 0 ? (
+                <ul className="space-y-1.5 pb-1">
+                  {graph.activities.map((activity) => (
+                    <li key={activity.id}>
+                      <button
+                        type="button"
+                        onClick={() => handleActivityClick(activity.highlightNodeId)}
+                        className={cn(
+                          "w-full rounded-md border border-border/60 bg-muted/30 px-2.5 py-1.5 text-left text-sm transition-colors",
+                          activity.highlightNodeId &&
+                            "hover:border-foreground/25 hover:bg-muted/50"
+                        )}
+                      >
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-mono text-[10px] text-muted-foreground">
+                            {formatActivityTime(activity.timestamp)}
+                          </span>
+                          {activity.eventType ? (
+                            <span
+                              className={cn(
+                                "rounded px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide",
+                                BADGE_STYLES[activity.eventType] ??
+                                  "bg-muted text-muted-foreground"
+                              )}
+                            >
+                              {eventBadgeLabel(activity.eventType)}
+                            </span>
+                          ) : null}
+                          <span className="text-xs text-foreground">
+                            {activity.agent ?? activity.tool ?? activity.message}
+                            {activity.durationMs != null
+                              ? ` · ${activity.durationMs}ms`
+                              : null}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-muted-foreground">
+                          {activity.message}
+                        </p>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="px-1 text-xs leading-snug text-muted-foreground">
+                  Trace events appear here as agents route, call tools, and hand off.
+                </p>
+              )}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

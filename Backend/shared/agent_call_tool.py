@@ -225,31 +225,22 @@ def bind_inter_agent_args(
     history:       list[dict],
 ):
     """
-    Return a thin wrapper around `tool_fn` that pre-fills the three
-    injected parameters (session_id, calling_agent, conversation_history_json)
-    so the LLM only ever sees and provides `task`.
-
-    The agent_node calls this once per invocation before passing the tool
-    to the LLM, ensuring the right session context is always injected.
-
-    Usage in agent_node:
-        bound = bind_inter_agent_args(
-            call_billing_agent,
-            session_id=req.session_id,
-            calling_agent="complaint",
-            history=req.conversation_history,
-        )
-        llm_with_tools = llm.bind_tools([*OWN_TOOLS, bound])
+    Return a thin wrapper around `tool_fn` with session context pre-filled.
+    The LLM only ever needs to provide `task`.
     """
-    history_json = json.dumps(history)
+    from langchain_core.tools import StructuredTool
+    from pydantic import BaseModel, Field
 
-    # LangChain tools are callable; we wrap with functools.partial-like logic
-    # by creating a new tool with the same name/description but pre-filled args.
-    original_name = tool_fn.name
-    original_desc = tool_fn.description
+    history_json   = json.dumps(history)
+    original_name  = tool_fn.name
+    original_desc  = tool_fn.description
 
-    @lc_tool(original_name, description=original_desc)
-    def _bound(task: str) -> str:
+    # Use StructuredTool.from_function for reliable .name/.description attributes
+    # across all LangChain versions — avoids @lc_tool decorator quirks.
+    class _BoundInput(BaseModel):
+        task: str = Field(description="The task description to pass to the agent.")
+
+    def _bound_fn(task: str) -> str:
         return tool_fn.invoke({
             "task":                      task,
             "session_id":                session_id,
@@ -257,4 +248,10 @@ def bind_inter_agent_args(
             "conversation_history_json": history_json,
         })
 
-    return _bound
+    bound_tool = StructuredTool.from_function(
+        func=_bound_fn,
+        name=original_name,
+        description=original_desc,
+        args_schema=_BoundInput,
+    )
+    return bound_tool
