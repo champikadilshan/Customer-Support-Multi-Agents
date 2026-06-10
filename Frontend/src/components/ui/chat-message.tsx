@@ -6,6 +6,7 @@ import { Ban, Loader2, Terminal } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { type HitlRequest } from "@/lib/hitl"
+import { getToolProgressMessage } from "@/lib/agent-status"
 import { AgentActivityIndicator } from "@/components/ui/agent-activity-indicator"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { StreamingMarkdown } from "@/components/ui/streaming-markdown"
@@ -86,6 +87,7 @@ export interface ChatMessageProps extends Message {
   isStreaming?: boolean
   enableTypewriter?: boolean
   statusMessage?: string
+  activeToolName?: string | null
   isHitlResponding?: boolean
   onHitlRespond?: (response: "yes" | "no") => void
 }
@@ -102,16 +104,13 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
   hitlResponse,
   isStreaming = false,
   enableTypewriter = false,
-  statusMessage = "Analyzing your request",
+  statusMessage = "Analyzing your message",
+  activeToolName = null,
   isHitlResponding = false,
   onHitlRespond,
 }) => {
   const isUser = role === "user"
   const isSystem = role === "system"
-  const hasActiveToolCall = toolInvocations?.some(
-    (invocation) => invocation.state === "call"
-  )
-
   const activeToolCalls =
     toolInvocations?.filter((invocation) => invocation.state === "call") ?? []
 
@@ -125,8 +124,8 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
       return (
         <AgentActivityIndicator
           message={
-            hasActiveToolCall
-              ? "Running tools in the background"
+            activeToolName
+              ? getToolProgressMessage(activeToolName)
               : statusMessage
           }
         />
@@ -263,11 +262,7 @@ function ToolCall({
               className="flex items-center gap-2 rounded-lg border bg-muted/50 px-3 py-2 text-sm text-muted-foreground"
             >
               <Terminal className="h-4 w-4" />
-              <span>
-                Calling{" "}
-                <span className="font-mono">{invocation.toolName}</span>
-                ...
-              </span>
+              <span>{getToolProgressMessage(invocation.toolName)}</span>
               <Loader2 className="h-3 w-3 animate-spin" />
             </div>
           )

@@ -5,7 +5,8 @@ import { ArrowDown } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { useAutoScroll } from "@/hooks/use-auto-scroll"
-import { formatAgentName } from "@/lib/agent-status"
+import { formatAgentName, getChatProgressMessage } from "@/lib/agent-status"
+import type { AgentGraphState } from "@/lib/agent-graph"
 import { Button } from "@/components/ui/button"
 import { type Message } from "@/components/ui/chat-message"
 import { CopyButton } from "@/components/ui/copy-button"
@@ -22,6 +23,7 @@ interface ChatProps {
   isGenerating: boolean
   isHitlPending?: boolean
   activeAgent?: string | null
+  agentGraph?: AgentGraphState | null
   respondToHitl?: (messageId: string, response: "yes" | "no") => void
   stop?: () => void
 }
@@ -35,6 +37,7 @@ export function Chat({
   isGenerating,
   isHitlPending = false,
   activeAgent = null,
+  agentGraph = null,
   respondToHitl,
   className,
 }: ChatProps) {
@@ -45,9 +48,10 @@ export function Chat({
     (message: Message) => {
       const isLastAssistant =
         message.id === lastMessage?.id && message.role === "assistant"
-      const hasActiveToolCall = message.toolInvocations?.some(
+      const activeToolInvocation = message.toolInvocations?.find(
         (invocation) => invocation.state === "call"
       )
+      const activeToolName = activeToolInvocation?.toolName ?? null
 
       return {
         actions: (
@@ -58,11 +62,8 @@ export function Chat({
         ),
         isStreaming: isGenerating && isLastAssistant,
         enableTypewriter: Boolean(isLastAssistant && message.createdAt),
-        statusMessage: hasActiveToolCall
-          ? "Running tools in the background"
-          : activeAgent
-            ? `Connecting to ${formatAgentName(activeAgent)} specialist`
-            : "Analyzing your request",
+        statusMessage: getChatProgressMessage(agentGraph, { activeToolName }),
+        activeToolName,
         isHitlResponding:
           isGenerating && Boolean(message.hitlResponse && message.hitlRequest),
         animation:
@@ -75,7 +76,7 @@ export function Chat({
             : undefined,
       }
     },
-    [activeAgent, isGenerating, lastMessage?.id, respondToHitl]
+    [agentGraph, isGenerating, lastMessage?.id, respondToHitl]
   )
 
   return (
