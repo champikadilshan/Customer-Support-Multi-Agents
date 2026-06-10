@@ -54,12 +54,16 @@ export type GraphActivity = {
   highlightNodeId?: AgentNodeId
 }
 
+export type CreateTicketPhase = "none" | "pre_hitl" | "post_resume"
+
 export type AgentGraphState = {
   nodes: Record<AgentNodeId, GraphNodeState>
   edges: GraphEdge[]
   handoffs: GraphHandoff[]
   activities: GraphActivity[]
   routedAgent: AgentNodeId | null
+  /** Tracks first vs second create_ticket invocation for Ticket DB highlighting. */
+  createTicketPhase: CreateTicketPhase
   traceConnected: boolean
   lastEventAt: number | null
 }
@@ -173,6 +177,7 @@ export function createInitialAgentGraphState(): AgentGraphState {
     handoffs: [],
     activities: [],
     routedAgent: null,
+    createTicketPhase: "none",
     traceConnected: false,
     lastEventAt: null,
   }

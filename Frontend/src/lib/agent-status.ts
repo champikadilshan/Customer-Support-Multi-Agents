@@ -99,7 +99,7 @@ function formatHumanActivityMessage(activity: GraphActivity) {
       return "Handing off"
     }
     case "hitl_requested":
-      return "Ready for review"
+      return "Awaiting human input"
     case "hitl_resumed":
       return "Resuming"
     case "tool_end":
