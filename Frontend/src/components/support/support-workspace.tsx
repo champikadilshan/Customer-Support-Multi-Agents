@@ -14,10 +14,10 @@ export function SupportWorkspace() {
 
   return (
     <>
-      <div className="flex w-full gap-6 pt-[42px] pl-3 pr-4 md:pl-5 md:pr-6">
+      <div className="flex w-full gap-6 pt-4 pl-3 pr-4 md:pl-5 md:pr-6">
         <aside
           aria-label="Support sidebar"
-          className="order-2 hidden h-[calc(100vh-7rem-42px)] min-h-[448px] min-w-0 flex-1 md:order-1 md:block"
+          className="order-2 hidden h-[calc(100vh-7rem-18px)] min-h-[448px] min-w-0 flex-1 md:order-1 md:block"
         >
           <RightSidebar
             graph={chat.agentGraph}
@@ -27,7 +27,7 @@ export function SupportWorkspace() {
 
         <div
           className={cn(
-            "order-1 flex h-[calc(100vh-7rem-42px)] min-h-[448px] w-full flex-col overflow-hidden rounded-lg border border-border px-4 pb-2.5 pt-4 md:order-2 md:w-[min(100%,360px)] md:shrink-0 lg:w-[380px]"
+            "order-1 flex h-[calc(100vh-7rem-18px)] min-h-[448px] w-full flex-col overflow-hidden rounded-lg border border-border px-4 pb-2.5 pt-4 md:order-2 md:w-[min(100%,360px)] md:shrink-0 lg:w-[380px]"
           )}
         >
           <div className="mb-2 flex shrink-0 justify-end">

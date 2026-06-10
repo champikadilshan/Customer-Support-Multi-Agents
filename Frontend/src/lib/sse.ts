@@ -12,8 +12,11 @@ export type SseEvent =
         question: string
         ticket_preview: {
           title?: string
+          description?: string
+          customer_id?: string
           category?: string
           priority?: string
+          staged?: boolean
         }
         options: string[]
       }

@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils"
 import "./globals.css"
 
 export const metadata: Metadata = {
-  title: "virtusa-multi-agent",
+  title: "Customer Support",
   description:
     "Customer support powered by AI billing, sales, and complaint agents in one place.",
 }
