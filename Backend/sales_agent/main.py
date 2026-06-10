@@ -1,278 +1,262 @@
+import json
+import re as _re
+import sys
+import os
+import uvicorn
+
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from langgraph.graph import StateGraph, END
-from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, BaseMessage
-from typing import TypedDict, Annotated
-import operator
-
-import sys, os
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+from fastapi.responses import StreamingResponse
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from typing import AsyncIterator
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
-from shared.config import SALES_AGENT_PORT
+from shared.config import SALES_AGENT_PORT, AGENT_HOST, SALES_MCP_PORT
 from shared.llm import get_vertex_llm
+from shared.message_utils import dicts_to_messages, messages_to_dicts
+from shared.agent_call_tool import make_agent_call_tool, bind_inter_agent_args
+from shared.agent_loop import run_agent_loop, get_final_text
+from shared.trace_emitter import trace_emitter
 
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOLS
-# ══════════════════════════════════════════════════════════════════════════════
-
-@tool
-def get_product_catalog(category: str) -> list[dict]:
-    """
-    Retrieve products available in a given category with descriptions and prices.
-    Use this when the user asks about what products are available,
-    wants to compare options, or is looking for something specific.
-    Categories: internet, mobile, tv, bundle.
-    Pass 'all' to get every product across all categories.
-    """
-    catalog = {
-        "internet": [
-            {"id": "INT-001", "name": "Fiber Basic",    "speed": "100 Mbps", "price": "$39.99/mo",  "description": "Great for light browsing and streaming"},
-            {"id": "INT-002", "name": "Fiber Pro",      "speed": "500 Mbps", "price": "$59.99/mo",  "description": "Perfect for remote work and HD streaming"},
-            {"id": "INT-003", "name": "Fiber Ultra",    "speed": "1 Gbps",   "price": "$89.99/mo",  "description": "Best for heavy users, gamers, and large households"},
-        ],
-        "mobile": [
-            {"id": "MOB-001", "name": "Starter SIM",   "data": "5 GB",      "price": "$15.00/mo",  "description": "For light mobile users"},
-            {"id": "MOB-002", "name": "Standard SIM",  "data": "20 GB",     "price": "$29.00/mo",  "description": "Balanced data plan for everyday use"},
-            {"id": "MOB-003", "name": "Unlimited SIM", "data": "Unlimited", "price": "$45.00/mo",  "description": "No limits — calls, texts, and data"},
-        ],
-        "tv": [
-            {"id": "TV-001",  "name": "Basic TV",      "channels": "50+",   "price": "$25.00/mo",  "description": "Essential channels including local and news"},
-            {"id": "TV-002",  "name": "Entertainment", "channels": "150+",  "price": "$45.00/mo",  "description": "Movies, sports, and lifestyle channels"},
-            {"id": "TV-003",  "name": "Premium TV",    "channels": "300+",  "price": "$65.00/mo",  "description": "Full package with premium and international channels"},
-        ],
-        "bundle": [
-            {"id": "BND-001", "name": "Home Bundle",   "includes": "Fiber Basic + Basic TV",         "price": "$54.99/mo",  "saving": "Save $10/mo"},
-            {"id": "BND-002", "name": "Pro Bundle",    "includes": "Fiber Pro + Entertainment + SIM", "price": "$99.99/mo",  "saving": "Save $34/mo"},
-        ],
+mcp_client = MultiServerMCPClient({
+    "sales": {
+        "url":       f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse",
+        "transport": "sse",
     }
+})
 
-    if category == "all":
-        return [item for products in catalog.values() for item in products]
+_call_complaint_agent_tool = make_agent_call_tool(
+    target=AgentType.COMPLAINT,
+    description=(
+        "Call the complaint agent to check ticket status or complaint history. "
+        "Use this when the customer mentions a ticket number or asks about an existing complaint "
+        "during the sales conversation. Pass the customer_id or ticket_id in the task."
+    ),
+)
 
-    return catalog.get(category, [{"error": f"Unknown category: {category}. Use: internet, mobile, tv, bundle, all"}])
+_call_billing_agent_tool = make_agent_call_tool(
+    target=AgentType.BILLING,
+    description=(
+        "Call the billing agent to check a customer's balance or invoice history. "
+        "Use this when the customer wants to understand current charges before committing to a plan."
+    ),
+)
 
+llm       = get_vertex_llm(temperature=0, role="specialist")
+mcp_tools: list = []
 
-@tool
-def get_active_promotions() -> list[dict]:
-    """
-    Retrieve all currently active promotions, discounts, and special offers.
-    Use this when the user asks about deals, discounts, promotions,
-    or ways to save money.
-    """
-    # Simulated promotions DB
-    return [
-        {
-            "promo_id":   "PROMO-SUMMER24",
-            "title":      "Summer Upgrade Deal",
-            "description": "Upgrade to Fiber Pro and get 3 months at half price",
-            "discount":   "50% off for 3 months",
-            "expires":    "2024-08-31",
-            "applicable_to": ["INT-002"],
-        },
-        {
-            "promo_id":   "PROMO-BUNDLE10",
-            "title":      "Bundle & Save",
-            "description": "Take any bundle and get an extra $10 off per month",
-            "discount":   "$10/mo additional discount",
-            "expires":    "2024-12-31",
-            "applicable_to": ["BND-001", "BND-002"],
-        },
-        {
-            "promo_id":   "PROMO-NEWSIM",
-            "title":      "New SIM Offer",
-            "description": "First month free when you sign up for any mobile plan",
-            "discount":   "First month free",
-            "expires":    "2024-07-31",
-            "applicable_to": ["MOB-001", "MOB-002", "MOB-003"],
-        },
-    ]
+_TICKET_PATTERNS = _re.compile(
+    r"ticket\s*(number|#|no\.?)?\s*\d+|check\s*(my\s*)?(ticket|complaint)|"
+    r"status\s*of\s*(my\s*)?(ticket|complaint)|complaint\s*(history|status)",
+    _re.IGNORECASE,
+)
+
+_CUSTOMER_ID_PATTERN = _re.compile(
+    r"customer\s*(id\s*)?[:\s]*(CUST-\d+)", _re.IGNORECASE
+)
+
+_TICKET_ID_PATTERN = _re.compile(
+    r"ticket\s*(number|#|no\.?)?\s*(\d+)", _re.IGNORECASE
+)
 
 
-@tool
-def check_product_availability(product_id: str) -> dict:
-    """
-    Check whether a specific product is currently available and
-    how quickly it can be activated.
-    Use this when the user is ready to purchase or wants to know
-    if a product is in stock / can be set up.
-    """
-    # Simulated availability DB
-    availability = {
-        "INT-001": {"available": True,  "activation": "Same day",      "contract": "No contract"},
-        "INT-002": {"available": True,  "activation": "Same day",      "contract": "12-month option for discount"},
-        "INT-003": {"available": True,  "activation": "Next business day", "contract": "12-month option for discount"},
-        "MOB-001": {"available": True,  "activation": "SIM delivered in 2-3 days", "contract": "No contract"},
-        "MOB-002": {"available": True,  "activation": "SIM delivered in 2-3 days", "contract": "No contract"},
-        "MOB-003": {"available": True,  "activation": "SIM delivered in 2-3 days", "contract": "No contract"},
-        "TV-001":  {"available": True,  "activation": "Same day (streaming app)",  "contract": "No contract"},
-        "TV-002":  {"available": True,  "activation": "Same day (streaming app)",  "contract": "No contract"},
-        "TV-003":  {"available": False, "activation": "Coming soon",    "contract": "N/A"},
-        "BND-001": {"available": True,  "activation": "Same day",      "contract": "12-month recommended"},
-        "BND-002": {"available": True,  "activation": "Next business day", "contract": "12-month recommended"},
-    }
+def _needs_complaint_check(message: str) -> tuple[bool, str]:
+    match = _TICKET_PATTERNS.search(message)
+    if not match:
+        return False, ""
 
-    return availability.get(
-        product_id,
-        {"available": False, "activation": "N/A", "contract": "N/A", "error": "Product ID not found"},
+    cust_match   = _CUSTOMER_ID_PATTERN.search(message)
+    ticket_match = _TICKET_ID_PATTERN.search(message)
+    customer_id  = cust_match.group(2)   if cust_match   else "CUST-001"
+    ticket_id    = ticket_match.group(2) if ticket_match else None
+
+    task = (
+        f"Check the status of ticket #{ticket_id} for customer {customer_id}."
+        if ticket_id
+        else f"Retrieve complaint history for customer {customer_id}."
     )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LANGGRAPH STATE
-# ══════════════════════════════════════════════════════════════════════════════
-
-class SalesState(TypedDict):
-    request_id:     str
-    user_message:   str
-    messages:       Annotated[list[BaseMessage], operator.add]
-    final_response: str
+    return True, task
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LLM — bind all tools
-# ══════════════════════════════════════════════════════════════════════════════
+USER_FACING_PROMPT = """You are a friendly, knowledgeable, and enthusiastic sales agent for a telecommunications company.
 
-TOOLS = [get_product_catalog, get_active_promotions, check_product_availability]
+CONVERSATION BEHAVIOUR:
+1. Greet the user warmly on the first message. Continue naturally on subsequent turns.
+2. Use tools to fetch real product data and promotions before making recommendations.
+3. Always mention relevant active promotions when recommending products.
+4. Use conversation history to resolve follow-up references without asking the customer
+   to repeat themselves.
+5. If the customer seems interested, highlight key benefits and active deals — never be pushy.
+6. If the customer is ready to purchase, let them know you can connect them to the activation team.
+7. Never expose raw tool output or JSON — translate everything into friendly language.
+8. Close warmly if the customer says goodbye.
 
-llm = get_vertex_llm(temperature=0)
-llm_with_tools = llm.bind_tools(TOOLS)
+COLLABORATION:
+- If the customer's message mentions a ticket number or complaint status, call
+  call_complaint_agent in the SAME turn alongside product tools.
+- If the customer mentions their current bill before committing to a plan,
+  call call_billing_agent with their account_id.
+- Weave all results into one seamless response."""
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NODES
-# ══════════════════════════════════════════════════════════════════════════════
-
-def agent_node(state: SalesState) -> SalesState:
-    """
-    Core ReAct node.
-    LLM decides whether to call a tool or give a final response.
-    Typical flow for a sales enquiry:
-      1. Calls get_product_catalog to find relevant products
-      2. Calls get_active_promotions to check for applicable deals
-      3. Optionally calls check_product_availability for a specific product
-      4. Produces a helpful, persuasive sales response
-    """
-    system_prompt = (
-        "You are a friendly and knowledgeable sales agent. "
-        "Your goal is to help customers find the best product for their needs "
-        "and highlight any relevant promotions or deals. "
-        "Use the available tools to fetch real product data and promotions. "
-        "Be enthusiastic but not pushy. Focus on value and fit for the customer's needs. "
-        "Always mention relevant active promotions when recommending products."
-    )
-
-    messages_with_system = [
-        {"role": "system", "content": system_prompt},
-        *state["messages"],
-    ]
-
-    response = llm_with_tools.invoke(messages_with_system)
-    return {"messages": [response]}
+INTERNAL_PROMPT = """You are the sales agent responding to an internal request from another agent.
+Return concise, factual product data. Do NOT greet. Just return the relevant information."""
 
 
-def format_response_node(state: SalesState) -> SalesState:
-    """
-    Extracts the final AI answer after the ReAct loop completes.
-    """
-    for msg in reversed(state["messages"]):
-        if hasattr(msg, "content") and msg.content:
-            final = msg.content
-            break
+def _get_last_human_text(messages: list) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            content = msg.content
+            return content if isinstance(content, str) else str(content)
+
+    return ""
+
+
+def _build_messages(req: A2ARequest) -> list:
+    system_prompt = INTERNAL_PROMPT if req.is_internal else USER_FACING_PROMPT
+
+    prior         = dicts_to_messages(req.conversation_history)
+    if not prior or not isinstance(prior[-1], HumanMessage):
+        prior.append(HumanMessage(content=req.user_message))
+
+    return [SystemMessage(content=system_prompt), *prior]
+
+
+def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
+    if req.is_internal:
+        tools = list(mcp_tools)
     else:
-        final = "I was unable to retrieve product information at this time. Please try again."
+        bound_complaint = bind_inter_agent_args(
+            _call_complaint_agent_tool,
+            session_id=session_id,
+            calling_agent=AgentType.SALES.value,
+            history=req.conversation_history,
+        )
 
-    return {**state, "final_response": final}
+        bound_billing = bind_inter_agent_args(
+            _call_billing_agent_tool,
+            session_id=session_id,
+            calling_agent=AgentType.SALES.value,
+            history=req.conversation_history,
+        )
+
+        tools = [*mcp_tools, bound_complaint, bound_billing]
+
+    return {t.name: t for t in tools if hasattr(t, "name") and t.name}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BUILD GRAPH
-# ══════════════════════════════════════════════════════════════════════════════
+async def stream_sales_agent(req: A2ARequest) -> AsyncIterator[str]:
+    session_id = req.context.get("session_id", req.request_id)
+    trace_emitter.emit(session_id, "agent_start", agent="sales",is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
+    messages = _build_messages(req)
+    tool_map = _build_tool_map(req, session_id)
 
-def build_sales_graph() -> CompiledStateGraph:
-    """
-    Graph shape:
-                    START
-                      │
-                  agent_node  ◄──────────────┐
-                      │                       │
-          tools_condition (conditional edge)  │
-              ┌─────┴─────┐                  │
-           "tools"    "end"                  │
-              │            │                  │
-          tool_node    format_response        │
-              │            │                  │
-              └────────────┘──────────────────┘
-                            │
-                           END
-    """
-    graph = StateGraph(SalesState)
+    if not req.is_internal:
+        last_human = _get_last_human_text(messages)
 
-    graph.add_node("agent",           agent_node)
-    graph.add_node("tools",           ToolNode(TOOLS))
-    graph.add_node("format_response", format_response_node)
+        needs_check, task = _needs_complaint_check(last_human)
+        if needs_check:
+            bound_complaint = tool_map.get("call_complaint_agent")
+            if bound_complaint:
+                trace_emitter.emit(session_id, "agent_handoff", from_agent="sales", to_agent="complaint", reason=task)
+                complaint_result = bound_complaint.invoke({"task": task})
+                messages.insert(-1, HumanMessage(content=f"[Complaint agent result]: {complaint_result}" ))
 
-    graph.set_entry_point("agent")
+                tool_map = {k: v for k, v in tool_map.items()
+                            if k != "call_complaint_agent"}
 
-    graph.add_conditional_edges(
-        "agent",
-        tools_condition,
-        {
-            "tools": "tools",
-            END:     "format_response",
-        },
+    llm_with_tools = llm.bind_tools(list(tool_map.values()))
+
+    async for chunk in run_agent_loop(
+        llm_with_tools=llm_with_tools,
+        messages=messages,
+        tool_map=tool_map,
+        agent_name="sales",
+        session_id=session_id,
+        is_internal=req.is_internal,
+    ):
+        yield chunk
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global mcp_tools
+    mcp_url = f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse"
+    print(f"Connecting to Sales MCP server at {mcp_url} ...")
+
+    try:
+        mcp_tools = await mcp_client.get_tools()
+
+    except Exception as e:
+        raise RuntimeError( f"Sales MCP server not reachable at {mcp_url}."  ) from e
+
+    print(f"Loaded {len(mcp_tools)} MCP tools: {[t.name for t in mcp_tools]}")
+
+    yield
+
+
+app = FastAPI(title="Sales Agent", version="4.0", lifespan=lifespan)
+
+
+@app.post("/process/stream")
+async def process_stream(req: A2ARequest) -> StreamingResponse:
+    if not mcp_tools:
+        async def not_ready():
+            yield f"event: error\ndata: {json.dumps({'message': 'Sales agent not ready.'})}\n\n"
+
+        return StreamingResponse(not_ready(), media_type="text/event-stream",headers={"X-Accel-Buffering": "no"})
+
+    return StreamingResponse(
+        stream_sales_agent(req),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no"},
     )
-
-    graph.add_edge("tools",           "agent")
-    graph.add_edge("format_response", END)
-
-    return graph.compile()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FASTAPI — A2A endpoint
-# ══════════════════════════════════════════════════════════════════════════════
-
-app = FastAPI(title="Sales Agent", version="1.0")
-sales_graph: CompiledStateGraph = build_sales_graph()
 
 
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
-    """
-    A2A entry point — called by the Intent Detector orchestrator.
-    """
-    initial_state: SalesState = {
-        "request_id":     req.request_id,
-        "user_message":   req.user_message,
-        "messages":       [HumanMessage(content=req.user_message)],
-        "final_response": "",
-    }
+    if not mcp_tools:
+        return A2AResponse(request_id=req.request_id, source_agent=AgentType.SALES,status="error", result="Sales agent not ready.")
 
-    result = await sales_graph.ainvoke(initial_state)
+    session_id = req.context.get("session_id", req.request_id)
+
+    trace_emitter.emit(session_id, "agent_start", agent="sales", is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
+
+    final_text = ""
+
+    async for raw in stream_sales_agent(req):
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                payload = json.loads(line[5:].strip())
+                if payload.get("text"):
+                    final_text += payload["text"]
+            except json.JSONDecodeError:
+                pass
 
     return A2AResponse(
         request_id=req.request_id,
         source_agent=AgentType.SALES,
         status="success",
-        result=result["final_response"],
-        metadata={"tools_available": [t.name for t in TOOLS]},
+        result=final_text or "I was unable to retrieve product information.",
+        metadata={"mcp_url": f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse"},
     )
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "agent": "sales"}
+    return {
+        "status":    "ok"     if mcp_tools else "starting",
+        "agent":     "sales",
+        "mcp_tools": "loaded" if mcp_tools else "pending",
+        "tool_names": [t.name for t in mcp_tools] if mcp_tools else [],
+    }
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "sales_agent.main:app",
-        host="0.0.0.0",
-        port=SALES_AGENT_PORT,
-        reload=True,
-    )
+    uvicorn.run("sales_agent.main:app", host="0.0.0.0",
+                port=SALES_AGENT_PORT, reload=False)
