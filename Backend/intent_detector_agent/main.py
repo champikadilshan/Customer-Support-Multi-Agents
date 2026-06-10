@@ -1,19 +1,3 @@
-"""
-intent_detector/main.py  (v4 — agentic loop orchestrator, no LangGraph)
-
-The orchestrator is now a meta-agent that uses the ReAct agentic loop.
-Its tools are the three specialist agents (billing, complaint, sales) plus
-todo planning tools. The LLM decides which agent to call, when, and in
-what order — no hardcoded intent detection, no sticky routing, no keyword
-matching.
-
-The LLM reads the full conversation history and decides routing naturally
-because it has all the context it needs.
-
-Session management endpoints are unchanged.
-Trace endpoints are unchanged.
-"""
-
 import uuid
 import json
 import httpx
@@ -28,7 +12,6 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 from langchain_core.tools import tool as lc_tool
 from pydantic import BaseModel
 from typing import AsyncIterator, Optional
-
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import AGENT_URLS, INTENT_DETECTOR_PORT
 from shared.llm import get_vertex_llm
@@ -39,13 +22,8 @@ from shared.agent_loop import run_agent_loop, _sse, _extract_text
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-
-# ── LLM ───────────────────────────────────────────────────────────────────────
-
 llm = get_vertex_llm(temperature=0)
 
-
-# ── Request schemas ───────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message:    str
@@ -54,8 +32,6 @@ class ChatRequest(BaseModel):
 class SessionResetRequest(BaseModel):
     session_id: str
 
-
-# ── Orchestrator system prompt ────────────────────────────────────────────────
 
 ORCHESTRATOR_PROMPT = """You are the orchestration agent for a telecommunications customer support system.
 You coordinate three specialist agents to resolve customer requests:
@@ -82,28 +58,12 @@ Rules:
 - Use the customer's name if they provided it. Use account_id / customer_id if mentioned."""
 
 
-# ── Dispatch tools ────────────────────────────────────────────────────────────
-
-def _make_dispatch_tool(
-    agent_type: AgentType,
-    tool_name:  str,
-    description: str,
-):
-    """
-    Factory that creates a dispatch tool for a given specialist agent.
-    The tool calls the agent's /process/stream endpoint, collects tokens,
-    and returns the full response as a string.
-    """
+def _make_dispatch_tool( agent_type: AgentType, tool_name:  str,description: str,):
     agent_url = AGENT_URLS[agent_type]
     stream_url = agent_url.replace("/process", "/process/stream")
 
     @lc_tool(tool_name, description=description)
-    def _dispatch(
-        task:                str,
-        session_id:          str = "",
-        conversation_history: str = "[]",
-    ) -> str:
-        """Dispatch to specialist agent and return its response."""
+    def _dispatch(task:str,session_id:str = "",conversation_history: str = "[]", ) -> str:
         try:
             history = json.loads(conversation_history)
         except (json.JSONDecodeError, TypeError):
@@ -120,22 +80,14 @@ def _make_dispatch_tool(
             conversation_history=history,
         )
 
-        # Emit handoff trace
-        trace_emitter.emit(session_id, "agent_handoff",
-                           from_agent="orchestrator",
-                           to_agent=agent_type.value,
-                           reason=task[:120])
+        trace_emitter.emit(session_id, "agent_handoff", from_agent="orchestrator",to_agent=agent_type.value,reason=task[:120])
 
         collected: list[str] = []
         hitl_data: dict      = {}
 
         try:
             import httpx as _httpx
-            with _httpx.stream(
-                "POST", stream_url,
-                json=req.model_dump(),
-                timeout=60.0,
-            ) as response:
+            with _httpx.stream( "POST", stream_url, json=req.model_dump(), timeout=60.0, ) as response:
                 response.raise_for_status()
                 for raw_line in response.iter_lines():
                     if not raw_line.startswith("data:"):
@@ -153,12 +105,9 @@ def _make_dispatch_tool(
             return f"[{agent_type.value} agent error: {exc}]"
 
         if hitl_data:
-            # Store the request_id in the orchestrator's session store
-            # so /session/{sid} exposes it and the client can call /process/resume
             if session_id:
                 session_store.set_metadata(session_id, "hitl_pending_request_id", request_id)
-                session_store.set_metadata(session_id, "hitl_agent_port",
-                                           str(agent_url).rstrip("/"))
+                session_store.set_metadata(session_id, "hitl_agent_port", str(agent_url).rstrip("/"))
 
             return json.dumps({
                 "hitl_pending":   True,
@@ -212,26 +161,16 @@ DISPATCH_TOOLS = [dispatch_billing_agent, dispatch_complaint_agent, dispatch_sal
 TOOL_MAP       = {t.name: t for t in DISPATCH_TOOLS}
 
 
-# ── Core chat logic ───────────────────────────────────────────────────────────
-
 def _build_history_injection(session_id: str) -> str:
-    """Serialise session history as JSON string for tool args."""
     return json.dumps(session_store.get_messages(session_id))
 
 
-async def _run_orchestrator(
-    user_message: str,
-    session_id:   str,
-) -> AsyncIterator[str]:
-    """
-    Run the orchestrator agentic loop for one user turn.
-    Yields SSE strings.
-    """
+async def _run_orchestrator(user_message: str,session_id:   str,) -> AsyncIterator[str]:
     history = session_store.get_messages(session_id)
-
-    # Build enriched tool map that injects session_id + history automatically
     history_json   = json.dumps(history)
+
     enriched_tools = []
+
     for t in DISPATCH_TOOLS:
         @lc_tool(t.name, description=t.description)
         def _enriched(task: str, _t=t) -> str:
@@ -240,12 +179,12 @@ async def _run_orchestrator(
                 "session_id":           session_id,
                 "conversation_history": history_json,
             })
+
         enriched_tools.append(_enriched)
 
     enriched_tool_map = {t.name: t for t in enriched_tools}
     llm_with_tools    = llm.bind_tools(enriched_tools)
 
-    # Build messages
     prior = dicts_to_messages(history)
     if not prior or not isinstance(prior[-1], HumanMessage):
         prior.append(HumanMessage(content=user_message))
@@ -266,22 +205,14 @@ async def _run_orchestrator(
         yield chunk
 
 
-# ── SSE helpers ───────────────────────────────────────────────────────────────
-
 def _make_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-# ── Streaming pipeline with session management ────────────────────────────────
-
-async def stream_from_orchestrator(
-    user_message: str,
-    session_id:   Optional[str],
-) -> AsyncIterator[str]:
+async def stream_from_orchestrator(user_message: str,session_id:   Optional[str],) -> AsyncIterator[str]:
     sess = session_store.get_or_create(session_id)
     sid  = sess.session_id
 
-    # Append user message to session
     session_store.append_messages(sid, [{"type": "human", "content": user_message}])
 
     yield _make_sse("session", {"session_id": sid})
@@ -290,9 +221,9 @@ async def stream_from_orchestrator(
     hitl_data:        dict      = {}
 
     async for raw in _run_orchestrator(user_message, sid):
-        # Parse every data: line within each SSE chunk for token collection
         for line in raw.splitlines():
             line = line.strip()
+
             if not line.startswith("data:"):
                 continue
             try:
@@ -303,19 +234,16 @@ async def stream_from_orchestrator(
                     hitl_data = payload
             except json.JSONDecodeError:
                 pass
+
         yield raw
 
-    # Write AI response to session
     ai_text = "".join(collected_tokens)
     if ai_text:
         session_store.append_messages(sid, [{"type": "ai", "content": ai_text}])
 
-    # Surface HITL if present
     if hitl_data and not hitl_data.get("text"):
         yield _make_sse("hitl_request", hitl_data)
 
-
-# ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Orchestrator", version="4.0")
 
@@ -343,15 +271,14 @@ async def chat(payload: ChatRequest) -> dict:
         for line in raw.splitlines():
             line = line.strip()
             if line.startswith("event:") and "hitl_request" in line:
-                # Next data: line will have the hitl payload
                 continue
             if not line.startswith("data:"):
                 continue
+
             try:
                 p = json.loads(line[5:].strip())
                 if p.get("text"):
                     collected_tokens.append(p["text"])
-                # Detect HITL — either via ticket_preview or hitl_pending flag
                 if p.get("ticket_preview") or p.get("hitl_pending"):
                     hitl_data = p
             except json.JSONDecodeError:
@@ -366,7 +293,6 @@ async def chat(payload: ChatRequest) -> dict:
         "response":   final_text,
     }
     if hitl_data:
-        # request_id was stored in session metadata by the dispatch tool
         rid = session_store.get_metadata(sid, "hitl_pending_request_id")
         result["hitl_pending"]   = True
         result["request_id"]     = rid
@@ -377,13 +303,12 @@ async def chat(payload: ChatRequest) -> dict:
     return result
 
 
-# ── Session management ────────────────────────────────────────────────────────
-
 @app.post("/session/reset")
 def session_reset(body: SessionResetRequest) -> dict:
     ok = session_store.reset(body.session_id)
     if not ok:
         raise HTTPException(status_code=404, detail=f"Session '{body.session_id}' not found.")
+
     return {"status": "reset", "session_id": body.session_id}
 
 
@@ -392,6 +317,7 @@ def session_delete(session_id: str) -> dict:
     ok = session_store.delete(session_id)
     if not ok:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+
     return {"status": "deleted", "session_id": session_id}
 
 
@@ -400,10 +326,9 @@ def session_info(session_id: str) -> dict:
     info = session_store.session_info(session_id)
     if info is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+
     return info
 
-
-# ── Trace endpoints ───────────────────────────────────────────────────────────
 
 @app.post("/internal/trace")
 async def internal_trace(event: dict) -> dict:
@@ -415,6 +340,7 @@ async def internal_trace(event: dict) -> dict:
 async def chat_trace(session_id: str) -> StreamingResponse:
     if session_store.get(session_id) is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+
     return StreamingResponse(
         trace_emitter.stream(session_id, timeout_s=300),
         media_type="text/event-stream",
@@ -429,8 +355,6 @@ def chat_trace_replay(session_id: str) -> dict:
     return {"session_id": session_id, "events": trace_emitter.get_events(session_id)}
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
-
 @app.get("/health")
 def health():
     return {
@@ -439,8 +363,6 @@ def health():
         "active_sessions": len(session_store.all_session_ids()),
     }
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run(
