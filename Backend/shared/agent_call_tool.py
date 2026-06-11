@@ -10,7 +10,6 @@ from shared.a2a_protocol import A2ARequest, AgentType
 from shared.config import AGENT_URLS
 from shared.trace_emitter import trace_emitter
 
-
 INTERNAL_TIMEOUT = 20.0   # seconds
 
 
@@ -148,4 +147,5 @@ def bind_inter_agent_args( tool_fn,session_id:str,calling_agent: str, history:li
         description=original_desc,
         args_schema=_BoundInput,
     )
+
     return bound_tool

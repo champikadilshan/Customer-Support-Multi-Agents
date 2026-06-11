@@ -1,17 +1,3 @@
-"""
-billing_agent/main.py
-
-Tools reduced from three hardcoded query functions to two generic tools:
-
-  get_tables        — returns full schema (table names + columns + types)
-                      cached in memory after first call, schema never changes at runtime
-
-  query_database    — LLM composes and runs any SELECT query
-                      read-only enforced: INSERT / UPDATE / DELETE / DROP / ALTER / PRAGMA
-                      are all rejected before execution
-                      results capped at MAX_ROWS to protect context window
-"""
-
 import json
 import re
 import sys
@@ -35,12 +21,8 @@ from billing_agent.database import create_db_and_tables, engine
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
 MAX_ROWS = 50   # max rows returned to LLM — protects context window
 
-# Disallowed SQL statement types — checked against the first keyword of the
-# stripped, uppercased query.  We block writes and schema mutations entirely.
 _WRITE_KEYWORDS = {
     "INSERT", "UPDATE", "DELETE", "REPLACE",
     "DROP", "ALTER", "CREATE", "TRUNCATE",
@@ -48,9 +30,6 @@ _WRITE_KEYWORDS = {
     "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
 }
 
-# ── Schema cache ──────────────────────────────────────────────────────────────
-# Populated once on first get_tables call, reused for every subsequent call.
-# The billing schema never changes at runtime so this is always safe.
 _schema_cache: Optional[list[dict]] = None
 
 
@@ -83,12 +62,10 @@ def _is_select_only(sql: str) -> tuple[bool, str]:
             f"Got: {first_word}"
         )
 
-    # Check for stacked statements — find every token after a semicolon
     statements = [s.strip() for s in cleaned.split(";") if s.strip()]
-    for stmt in statements[1:]:                     # skip the first SELECT
+    for stmt in statements[1:]:
         word = stmt.split()[0].upper() if stmt.split() else ""
         if word in _WRITE_KEYWORDS or word == "SELECT":
-            # Even a second SELECT is suspicious in a stacked context — reject
             return False, (
                 f"Stacked statements are not allowed. "
                 f"Found '{word}' after semicolon."
@@ -96,8 +73,6 @@ def _is_select_only(sql: str) -> tuple[bool, str]:
 
     return True, ""
 
-
-# ── Tools ─────────────────────────────────────────────────────────────────────
 
 @lc_tool(
     "get_tables",
@@ -115,8 +90,8 @@ def get_tables() -> list[dict]:
         return _schema_cache
 
     schema = []
+
     with engine.connect() as conn:
-        # Get all user-created tables (exclude SQLite internals)
         tables_result = conn.execute(
             __import__("sqlalchemy").text(
                 "SELECT name FROM sqlite_master "
@@ -124,12 +99,11 @@ def get_tables() -> list[dict]:
                 "ORDER BY name"
             )
         )
+
         table_names = [row[0] for row in tables_result]
 
         for table_name in table_names:
-            cols_result = conn.execute(
-                __import__("sqlalchemy").text(f"PRAGMA table_info('{table_name}')")
-            )
+            cols_result = conn.execute(  __import__("sqlalchemy").text(f"PRAGMA table_info('{table_name}')") )
             columns = [
                 {
                     "name":     row[1],
@@ -165,7 +139,6 @@ def get_tables() -> list[dict]:
     ),
 )
 def query_database(sql: str) -> dict:
-    # ── Safety check ─────────────────────────────────────────────────────────
     ok, reason = _is_select_only(sql)
     if not ok:
         return {
@@ -174,13 +147,13 @@ def query_database(sql: str) -> dict:
             "sql":     sql,
         }
 
-    # ── Execute ───────────────────────────────────────────────────────────────
     try:
         import sqlalchemy
+
         with engine.connect() as conn:
             result = conn.execute(sqlalchemy.text(sql))
             columns = list(result.keys())
-            rows    = result.fetchmany(MAX_ROWS + 1)   # fetch one extra to detect truncation
+            rows    = result.fetchmany(MAX_ROWS + 1)
 
         truncated = len(rows) > MAX_ROWS
         rows      = rows[:MAX_ROWS]
@@ -200,9 +173,6 @@ def query_database(sql: str) -> dict:
             "sql":   sql,
         }
 
-
-# ── Inter-agent tool ──────────────────────────────────────────────────────────
-
 _call_complaint_agent_tool = make_agent_call_tool(
     target=AgentType.COMPLAINT,
     description=(
@@ -219,8 +189,6 @@ _call_complaint_agent_tool = make_agent_call_tool(
 )
 
 OWN_TOOLS = [get_tables, query_database]
-
-# ── Prompts ───────────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a helpful and professional billing support agent for a telecommunications company.
 
@@ -260,12 +228,10 @@ Return a concise factual answer. Do NOT greet.
 Use get_tables then query_database to fetch the data.
 Default to account_id 'ACC-001' if none is specified."""
 
-# ── LLM + checkpointer ────────────────────────────────────────────────────────
 
 llm           = get_vertex_llm(temperature=0, role="specialist")
 _checkpointer = InMemorySaver()   # production: AsyncPostgresSaver
 
-# ── Agent factory ─────────────────────────────────────────────────────────────
 
 def _build_agent(req: A2ARequest, session_id: str):
     if req.is_internal:
@@ -299,25 +265,23 @@ def _build_messages(req: A2ARequest) -> list[dict]:
         elif t == "ai":
             msgs.append({"role": "assistant", "content": d.get("content", "")})
         elif t == "tool":
-            msgs.append({"role": "tool",      "content": d.get("content", ""),
-                         "name": d.get("name", ""),
-                         "tool_call_id": d.get("tool_call_id", "")})
+            msgs.append({"role": "tool",      "content": d.get("content", ""),"name": d.get("name", ""), "tool_call_id": d.get("tool_call_id", "")})
 
     last_is_user = (
         msgs and
         msgs[-1]["role"] == "user" and
         msgs[-1]["content"] == req.user_message
     )
+
     if not last_is_user:
         msgs.append({"role": "user", "content": req.user_message})
 
     return msgs
 
 
-# ── Streaming entry point ─────────────────────────────────────────────────────
-
 async def stream_billing_agent(req: A2ARequest) -> AsyncIterator[str]:
     session_id = req.context.get("session_id", req.request_id)
+
     trace_emitter.emit(
         session_id, "agent_start", agent="billing",
         is_internal=req.is_internal,
@@ -336,8 +300,6 @@ async def stream_billing_agent(req: A2ARequest) -> AsyncIterator[str]:
     ):
         yield chunk
 
-
-# ── FastAPI ───────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Billing Agent", version="5.0")
 
