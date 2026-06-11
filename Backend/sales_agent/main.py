@@ -5,12 +5,15 @@ Refactored to use langchain.agents.create_agent.
 MCP tools from langchain_mcp_adapters are standard BaseTool instances —
 they slot directly into create_agent's tools list with no special handling.
 
-The pre-flight complaint check (pattern-matching on the user message) stays
-as a thin wrapper before the agent runs — it's pre-processing, not loop logic.
+Pre-flight complaint check removed:
+  The old pre-processing block pattern-matched the user message and called
+  the complaint agent before the LLM ran.  This caused duplicate complaint
+  calls when the orchestrator had already dispatched to complaint in parallel.
+  The LLM now decides whether to call call_complaint_agent via tool use —
+  same result, no duplication.
 """
 
 import json
-import re as _re
 import sys
 import os
 import uvicorn
@@ -78,48 +81,20 @@ CONVERSATION BEHAVIOUR:
 7. Never expose raw tool output or JSON — translate everything into friendly language.
 8. Close warmly if the customer says goodbye.
 
-COLLABORATION:
-- If the customer's message mentions a ticket number or complaint status, call
-  call_complaint_agent in the SAME turn alongside product tools.
-- If the customer mentions their current bill before committing to a plan,
-  call call_billing_agent with their account_id.
+COLLABORATION — A2A sub-agent calls (use these tools when YOU need the data):
+- call_complaint_agent: call this when the customer mentions a ticket number,
+  asks about a specific complaint, or you need complaint context to answer a
+  sales question. Do NOT call this just because the user asked about complaints
+  in general — the orchestrator handles pure complaint requests directly.
+- call_billing_agent: call this when the customer mentions their current bill
+  or account balance and you need that data before recommending a plan.
+- Only make A2A calls when the data is genuinely needed to complete YOUR task.
+  If the orchestrator has already handled the complaint/billing part separately,
+  do not duplicate that call.
 - Weave all results into one seamless response."""
 
 INTERNAL_PROMPT = """You are the sales agent responding to an internal request from another agent.
 Return concise, factual product data. Do NOT greet. Just return the relevant information."""
-
-# ── Pre-flight complaint pattern (pre-processing, NOT loop logic) ─────────────
-
-_TICKET_PATTERNS = _re.compile(
-    r"ticket\s*(number|#|no\.?)?\s*\d+|check\s*(my\s*)?(ticket|complaint)|"
-    r"status\s*of\s*(my\s*)?(ticket|complaint)|complaint\s*(history|status)",
-    _re.IGNORECASE,
-)
-_CUSTOMER_ID_PATTERN = _re.compile(r"customer\s*(id\s*)?[:\s]*(CUST-\d+)", _re.IGNORECASE)
-_TICKET_ID_PATTERN   = _re.compile(r"ticket\s*(number|#|no\.?)?\s*(\d+)", _re.IGNORECASE)
-
-
-def _complaint_preflight(message: str) -> tuple[bool, str]:
-    """
-    Detect complaint-related intent in the user message.
-    Returns (needs_check, task_description).
-    Kept here as pre-processing — the agent itself can also call
-    call_complaint_agent via tool use; this just speeds up the common case.
-    """
-    if not _TICKET_PATTERNS.search(message):
-        return False, ""
-
-    cust_match   = _CUSTOMER_ID_PATTERN.search(message)
-    ticket_match = _TICKET_ID_PATTERN.search(message)
-    customer_id  = cust_match.group(2)   if cust_match   else "CUST-001"
-    ticket_id    = ticket_match.group(2) if ticket_match else None
-
-    task = (
-        f"Check the status of ticket #{ticket_id} for customer {customer_id}."
-        if ticket_id
-        else f"Retrieve complaint history for customer {customer_id}."
-    )
-    return True, task
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -190,29 +165,11 @@ async def stream_sales_agent(req: A2ARequest) -> AsyncIterator[str]:
 
     messages = _build_messages(req)
 
-    # Pre-flight: if the user's message triggers a complaint check, resolve it
-    # synchronously and inject the result before the main agent runs.
-    # This stays here (not in the loop) because it's pre-processing logic.
-    if not req.is_internal:
-        needs_check, task = _complaint_preflight(req.user_message)
-        if needs_check:
-            bound_complaint = bind_inter_agent_args(
-                _call_complaint_agent_tool,
-                session_id=session_id,
-                calling_agent=AgentType.SALES.value,
-                history=req.conversation_history,
-            )
-            trace_emitter.emit(
-                session_id, "agent_handoff",
-                from_agent="sales", to_agent="complaint", reason=task,
-            )
-            complaint_result = bound_complaint.invoke({"task": task})
-            # Inject result as a system context message before the last user turn
-            messages.insert(-1, {
-                "role": "user",
-                "content": f"[Context from complaint agent]: {complaint_result}",
-            })
-
+    # No pre-flight complaint check here.
+    # The LLM calls call_complaint_agent via tool use when it genuinely needs
+    # complaint data to complete a sales task (A2A sub-agent pattern).
+    # Pre-flight was removed because it caused duplicate complaint calls when
+    # the orchestrator was already dispatching to complaint in parallel.
     agent = _build_agent(req, session_id)
 
     async for chunk in stream_agent_events(
