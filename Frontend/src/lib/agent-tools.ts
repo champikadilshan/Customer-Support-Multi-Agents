@@ -1,9 +1,8 @@
 import type { AgentNodeId } from "@/lib/agent-graph"
 
 export const TOOL_LABELS: Record<string, string> = {
-  get_account_balance: "Account Balance",
-  get_invoice_history: "Invoice History",
-  get_payment_methods: "Payment Methods",
+  get_tables: "Database Schema",
+  query_database: "Query Database",
   get_complaint_history: "Complaint History",
   get_ticket_status: "Ticket Status",
   categorize_complaint: "Categorize Complaint",
@@ -20,9 +19,8 @@ export const TOOL_LABELS: Record<string, string> = {
 /** Tools each agent can invoke (matches backend LangGraph tool lists). */
 export const AGENT_TOOL_IDS: Partial<Record<AgentNodeId, string[]>> = {
   billing: [
-    "get_account_balance",
-    "get_invoice_history",
-    "get_payment_methods",
+    "get_tables",
+    "query_database",
     "call_complaint_agent",
   ],
   complaint: [
@@ -48,15 +46,11 @@ export const TOOL_INFRA_ACTIVATION: Record<
   string,
   { nodes: AgentNodeId[]; edges: [AgentNodeId, AgentNodeId][] }
 > = {
-  get_account_balance: {
+  get_tables: {
     nodes: ["billing_db"],
     edges: [["billing", "billing_db"]],
   },
-  get_invoice_history: {
-    nodes: ["billing_db"],
-    edges: [["billing", "billing_db"]],
-  },
-  get_payment_methods: {
+  query_database: {
     nodes: ["billing_db"],
     edges: [["billing", "billing_db"]],
   },
