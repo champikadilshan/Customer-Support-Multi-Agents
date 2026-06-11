@@ -15,7 +15,7 @@ export const MIN_ACTIVE_VISIBLE_MS = 5000
 export const TICKET_SERVICE_ACTIVE_MS = 5000
 
 /** Brief DONE state before returning to idle (after the active hold). */
-export const MIN_COMPLETED_VISIBLE_MS = 400
+export const MIN_COMPLETED_VISIBLE_MS = 800
 
 /** Edges stay highlighted at least as long as the nodes they connect. */
 export const MIN_EDGE_VISIBLE_MS = 5000

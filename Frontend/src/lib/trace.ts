@@ -263,6 +263,51 @@ function getActiveHandoffParent(
   return null
 }
 
+/** Idle specialists not involved in the current orchestrator dispatch. */
+function idleInactiveSpecialists(
+  state: AgentGraphState,
+  activeSpecialist: AgentNodeId
+): AgentGraphState {
+  let next: AgentGraphState = { ...state, handoffs: [] }
+
+  for (const id of SPECIALIST_AGENTS) {
+    if (id === activeSpecialist) continue
+
+    next = setNode(next, id, "idle", undefined, {
+      runningTools: [],
+      completedTools: [],
+    })
+    next = setEdge(next, "intent_detector", id, "idle")
+
+    for (const other of SPECIALIST_AGENTS) {
+      if (other !== id) {
+        next = setEdge(next, id, other, "idle")
+      }
+    }
+
+    if (id === "billing") {
+      next = setNode(next, "billing_db", "idle")
+      next = setEdge(next, "billing", "billing_db", "idle")
+    }
+  }
+
+  return next
+}
+
+function hasStaleTurnState(state: AgentGraphState): boolean {
+  if (state.routedAgent !== null || state.handoffs.length > 0) return true
+  return SPECIALIST_AGENTS.some((id) => state.nodes[id].status !== "idle")
+}
+
+export function isNewUserTurnEvent(event: TraceEvent): boolean {
+  if (event.type === "orchestrator_dispatch") return true
+  return (
+    event.type === "agent_start" &&
+    !event.is_internal &&
+    (event.agent === "orchestrator" || event.agent === "intent_detector")
+  )
+}
+
 function activatePrimaryRoute(
   state: AgentGraphState,
   agentId: AgentNodeId,
@@ -355,6 +400,20 @@ export function reduceAgentGraphOnTraceEvent(
     }
 
     case "agent_start": {
+      // New user message — reset stale graph when orchestrator_dispatch was missed.
+      if (
+        !event.is_internal &&
+        (event.agent === "orchestrator" || event.agent === "intent_detector")
+      ) {
+        if (hasStaleTurnState(next)) {
+          next = resetTurnState(next)
+        }
+        if (next.nodes.intent_detector.status !== "active") {
+          next = setNode(next, "intent_detector", "active", "Processing request...")
+        }
+        break
+      }
+
       const agentId = mapTraceAgent(event.agent)
       if (!agentId || agentId === "intent_detector") break
 
@@ -527,6 +586,7 @@ export function reduceAgentGraphOnTraceEvent(
           next = setNode(next, toId, "active", toDetail)
 
           if (fromOrchestrator) {
+            next = idleInactiveSpecialists(next, toId)
             next = { ...next, routedAgent: toId }
             next = ensureOrchestratorRouteTo(next, toId, "active")
             next = setNode(next, fromId, "idle")
