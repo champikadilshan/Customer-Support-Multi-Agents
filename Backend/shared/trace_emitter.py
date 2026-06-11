@@ -120,5 +120,4 @@ class TraceEmitter:
         except Exception:
             pass
 
-
 trace_emitter = TraceEmitter()

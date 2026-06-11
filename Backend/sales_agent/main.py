@@ -1,18 +1,3 @@
-"""
-sales_agent/main.py
-
-Refactored to use langchain.agents.create_agent.
-MCP tools from langchain_mcp_adapters are standard BaseTool instances —
-they slot directly into create_agent's tools list with no special handling.
-
-Pre-flight complaint check removed:
-  The old pre-processing block pattern-matched the user message and called
-  the complaint agent before the LLM ran.  This caused duplicate complaint
-  calls when the orchestrator had already dispatched to complaint in parallel.
-  The LLM now decides whether to call call_complaint_agent via tool use —
-  same result, no duplication.
-"""
-
 import json
 import sys
 import os
@@ -36,8 +21,6 @@ from shared.trace_emitter import trace_emitter
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# ── MCP client (connected at startup) ────────────────────────────────────────
-
 mcp_client = MultiServerMCPClient({
     "sales": {
         "url":       f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse",
@@ -47,7 +30,6 @@ mcp_client = MultiServerMCPClient({
 
 mcp_tools: list = []   # populated in lifespan
 
-# ── Inter-agent call tools ────────────────────────────────────────────────────
 
 _call_complaint_agent_tool = make_agent_call_tool(
     target=AgentType.COMPLAINT,
@@ -66,7 +48,6 @@ _call_billing_agent_tool = make_agent_call_tool(
     ),
 )
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
 
 USER_FACING_PROMPT = """You are a friendly, knowledgeable, and enthusiastic sales agent for a telecommunications company.
 
@@ -96,18 +77,16 @@ COLLABORATION — A2A sub-agent calls (use these tools when YOU need the data):
 INTERNAL_PROMPT = """You are the sales agent responding to an internal request from another agent.
 Return concise, factual product data. Do NOT greet. Just return the relevant information."""
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
 
 llm          = get_vertex_llm(temperature=0, role="specialist")
 _checkpointer = InMemorySaver()
 
-# ── Agent factory ─────────────────────────────────────────────────────────────
 
 def _build_agent(req: A2ARequest, session_id: str):
     if req.is_internal:
-        # Internal callers only need MCP product tools
         tools  = list(mcp_tools)
         prompt = INTERNAL_PROMPT
+
     else:
         bound_complaint = bind_inter_agent_args(
             _call_complaint_agent_tool,
@@ -115,13 +94,14 @@ def _build_agent(req: A2ARequest, session_id: str):
             calling_agent=AgentType.SALES.value,
             history=req.conversation_history,
         )
+
         bound_billing = bind_inter_agent_args(
             _call_billing_agent_tool,
             session_id=session_id,
             calling_agent=AgentType.SALES.value,
             history=req.conversation_history,
         )
-        # MCP tools + inter-agent tools — all are standard BaseTool instances
+
         tools  = [*mcp_tools, bound_complaint, bound_billing]
         prompt = USER_FACING_PROMPT
 
@@ -136,8 +116,10 @@ def _build_agent(req: A2ARequest, session_id: str):
 
 def _build_messages(req: A2ARequest) -> list[dict]:
     msgs = []
+
     for d in req.conversation_history:
         t = d.get("type", "")
+
         if t == "human":
             msgs.append({"role": "user",      "content": d.get("content", "")})
         elif t == "ai":
@@ -147,16 +129,16 @@ def _build_messages(req: A2ARequest) -> list[dict]:
                          "name": d.get("name", ""), "tool_call_id": d.get("tool_call_id", "")})
 
     last_is_user = msgs and msgs[-1]["role"] == "user" and msgs[-1]["content"] == req.user_message
+
     if not last_is_user:
         msgs.append({"role": "user", "content": req.user_message})
 
     return msgs
 
 
-# ── Streaming entry point ─────────────────────────────────────────────────────
-
 async def stream_sales_agent(req: A2ARequest) -> AsyncIterator[str]:
     session_id = req.context.get("session_id", req.request_id)
+
     trace_emitter.emit(
         session_id, "agent_start", agent="sales",
         is_internal=req.is_internal,
@@ -164,12 +146,6 @@ async def stream_sales_agent(req: A2ARequest) -> AsyncIterator[str]:
     )
 
     messages = _build_messages(req)
-
-    # No pre-flight complaint check here.
-    # The LLM calls call_complaint_agent via tool use when it genuinely needs
-    # complaint data to complete a sales task (A2A sub-agent pattern).
-    # Pre-flight was removed because it caused duplicate complaint calls when
-    # the orchestrator was already dispatching to complaint in parallel.
     agent = _build_agent(req, session_id)
 
     async for chunk in stream_agent_events(
@@ -182,18 +158,21 @@ async def stream_sales_agent(req: A2ARequest) -> AsyncIterator[str]:
         yield chunk
 
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mcp_tools
     mcp_url = f"http://{AGENT_HOST}:{SALES_MCP_PORT}/sse"
+
     print(f"Connecting to Sales MCP server at {mcp_url} ...")
+
     try:
         mcp_tools = await mcp_client.get_tools()
+
     except Exception as e:
         raise RuntimeError(f"Sales MCP server not reachable at {mcp_url}.") from e
+
     print(f"Loaded {len(mcp_tools)} MCP tools: {[t.name for t in mcp_tools]}")
+
     yield
 
 
@@ -205,8 +184,7 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
     if not mcp_tools:
         async def not_ready():
             yield f"event: error\ndata: {json.dumps({'message': 'Sales agent not ready.'})}\n\n"
-        return StreamingResponse(not_ready(), media_type="text/event-stream",
-                                 headers={"X-Accel-Buffering": "no"})
+        return StreamingResponse(not_ready(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
     return StreamingResponse(
         stream_sales_agent(req),
         media_type="text/event-stream",
@@ -221,6 +199,7 @@ async def process(req: A2ARequest) -> A2AResponse:
             request_id=req.request_id, source_agent=AgentType.SALES,
             status="error", result="Sales agent not ready.",
         )
+
     session_id = req.context.get("session_id", req.request_id)
     final_text = ""
 

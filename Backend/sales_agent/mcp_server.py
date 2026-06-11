@@ -17,8 +17,7 @@ def _create_driver():
     d = GraphDatabase.driver(
         NEO4J_URI,
         auth=(NEO4J_USERNAME, NEO4J_PASSWORD),
-        # Keep connections alive and reconnect automatically
-        max_connection_lifetime=200,        # recreate connections older than 200s
+        max_connection_lifetime=200,
         max_connection_pool_size=10,
         connection_acquisition_timeout=30,
         connection_timeout=15,
@@ -189,7 +188,6 @@ def check_product_availability(product_id: str) -> dict:
         return {"error": str(e)}
 
 
-
 async def health(request: Request) -> JSONResponse:
     neo4j_status = "unknown"
     try:
@@ -207,7 +205,6 @@ async def health(request: Request) -> JSONResponse:
         "service":      "sales_mcp",
         "neo4j":        neo4j_status,
     })
-
 
 
 mcp_app = mcp.sse_app()
