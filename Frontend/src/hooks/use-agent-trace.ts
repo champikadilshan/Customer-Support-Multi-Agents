@@ -6,6 +6,7 @@ import { createInitialAgentGraphState } from "@/lib/agent-graph"
 import {
   connectAgentTrace,
   fetchTraceReplay,
+  isNewUserTurnEvent,
   reduceAgentGraphOnTraceEvent,
   type TraceEvent,
 } from "@/lib/trace"
@@ -68,21 +69,31 @@ export function useAgentTrace(sessionId: string | null) {
     [scheduleResync]
   )
 
-  const applyTraceEvent = useCallback(
-    (event: TraceEvent) => {
-      logicalGraphRef.current = reduceAgentGraphOnTraceEvent(
-        logicalGraphRef.current,
-        event
-      )
-      setAgentGraph((display) => syncDisplayFromLogical(display))
-    },
-    [syncDisplayFromLogical]
-  )
-
   const clearSmoothing = useCallback(() => {
     clearResyncTimer()
     smoothingClockRef.current = createGraphSmoothingClock()
   }, [clearResyncTimer])
+
+  const applyTraceEvent = useCallback(
+    (event: TraceEvent) => {
+      if (isNewUserTurnEvent(event)) {
+        clearSmoothing()
+      }
+
+      logicalGraphRef.current = reduceAgentGraphOnTraceEvent(
+        logicalGraphRef.current,
+        event
+      )
+
+      if (isNewUserTurnEvent(event)) {
+        setAgentGraph(logicalGraphRef.current)
+        return
+      }
+
+      setAgentGraph((display) => syncDisplayFromLogical(display))
+    },
+    [clearSmoothing, syncDisplayFromLogical]
+  )
 
   const resetGraph = useCallback(() => {
     clearSmoothing()
