@@ -10,7 +10,6 @@ from ticket_service.models import (Ticket,TicketCreate, TicketResponse, TicketSt
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-
 DB_PATH      = Path(__file__).resolve().parent / "tickets.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 engine       = create_engine(DATABASE_URL, echo=False)
@@ -35,11 +34,11 @@ def on_startup():
 
 @app.post("/tickets", response_model=TicketResponse, status_code=201)
 def create_ticket(payload: TicketCreate,session: Session = Depends(get_session),):
-    """Create a new support ticket."""
     ticket = Ticket(**payload.model_dump())
     session.add(ticket)
     session.commit()
     session.refresh(ticket)
+
     return ticket
 
 

@@ -4,9 +4,8 @@ const TOOL_PROGRESS_MESSAGES: Record<string, string> = {
   dispatch_billing_agent: "Collecting billing info",
   dispatch_complaint_agent: "Collecting complaint info",
   dispatch_sales_agent: "Collecting sales info",
-  get_account_balance: "Checking balance",
-  get_invoice_history: "Fetching invoices",
-  get_payment_methods: "Fetching payments",
+  get_tables: "Loading schema",
+  query_database: "Querying database",
   get_complaint_history: "Fetching complaints",
   get_ticket_status: "Checking ticket",
   categorize_complaint: "Categorizing issue",
@@ -99,7 +98,7 @@ function formatHumanActivityMessage(activity: GraphActivity) {
       return "Handing off"
     }
     case "hitl_requested":
-      return "Ready for review"
+      return "Awaiting human input"
     case "hitl_resumed":
       return "Resuming"
     case "tool_end":

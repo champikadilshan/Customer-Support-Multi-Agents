@@ -1,160 +1,242 @@
 import json
+import re
 import sys
 import os
 import uvicorn
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage, SystemMessage
-from typing import AsyncIterator
-from pydantic import BaseModel
+from langchain.agents import create_agent
+from langchain_core.tools import tool as lc_tool
+from langgraph.checkpoint.memory import InMemorySaver
+from typing import AsyncIterator, Optional
+
 from shared.a2a_protocol import A2ARequest, A2AResponse, AgentType
 from shared.config import BILLING_AGENT_PORT
 from shared.llm import get_vertex_llm
-from shared.message_utils import dicts_to_messages, messages_to_dicts
 from shared.agent_call_tool import make_agent_call_tool, bind_inter_agent_args
-from shared.agent_loop import run_agent_loop, get_final_text
+from shared.agent_runner import stream_agent_events
 from shared.trace_emitter import trace_emitter
-from billing_agent.database import create_db_and_tables, get_session
-from billing_agent.models import AccountBalance, Invoice, PaymentMethod
-from sqlmodel import select
+from billing_agent.database import create_db_and_tables, engine
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from langchain_core.tools import tool as lc_tool
+MAX_ROWS = 50   # max rows returned to LLM — protects context window
+
+_WRITE_KEYWORDS = {
+    "INSERT", "UPDATE", "DELETE", "REPLACE",
+    "DROP", "ALTER", "CREATE", "TRUNCATE",
+    "ATTACH", "DETACH", "PRAGMA", "VACUUM",
+    "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+}
+
+_schema_cache: Optional[list[dict]] = None
+
+
+def _is_select_only(sql: str) -> tuple[bool, str]:
+    """
+    Returns (True, "") if sql is a safe SELECT-only query.
+    Returns (False, reason) otherwise.
+
+    Strategy:
+      1. Strip comments and leading whitespace.
+      2. Extract the first word — that is the statement type.
+      3. Reject if it is in the write/mutation keyword set.
+      4. Additionally scan the full statement for semicolons followed by
+         a write keyword — blocks stacked statements like
+         "SELECT 1; DROP TABLE accountbalance".
+    """
+    # Strip single-line comments (-- ...) and block comments (/* ... */)
+    cleaned = re.sub(r"--[^\n]*", " ", sql)
+    cleaned = re.sub(r"/\*.*?\*/", " ", cleaned, flags=re.DOTALL)
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        return False, "Empty query"
+
+    first_word = cleaned.split()[0].upper()
+
+    if first_word != "SELECT":
+        return False, (
+            f"Only SELECT statements are allowed. "
+            f"Got: {first_word}"
+        )
+
+    statements = [s.strip() for s in cleaned.split(";") if s.strip()]
+    for stmt in statements[1:]:
+        word = stmt.split()[0].upper() if stmt.split() else ""
+        if word in _WRITE_KEYWORDS or word == "SELECT":
+            return False, (
+                f"Stacked statements are not allowed. "
+                f"Found '{word}' after semicolon."
+            )
+
+    return True, ""
 
 
 @lc_tool(
-    "get_account_balance",
+    "get_tables",
     description=(
-        "Fetch the current account balance, payment due date, and payment status "
-        "for a given account ID. Use this when the user asks about their balance, "
-        "how much they owe, or when their next payment is due."
+        "Return the full schema of the billing database: every table name, "
+        "its columns, and their data types. "
+        "Always call this FIRST before query_database if you are unsure which "
+        "tables or columns exist. The result is cached — calling it multiple "
+        "times in one conversation is free."
     ),
 )
-def get_account_balance(account_id: str) -> dict:
-    with get_session() as session:
-        row = session.exec(
-            select(AccountBalance).where(AccountBalance.account_id == account_id)
-        ).first()
-    if not row:
-        return {"error": f"No account found for account_id '{account_id}'"}
+def get_tables() -> list[dict]:
+    global _schema_cache
+    if _schema_cache is not None:
+        return _schema_cache
 
-    return {
-        "account_id":     row.account_id,
-        "balance_due":    row.balance_due,
-        "due_date":       row.due_date,
-        "payment_status": row.payment_status,
-        "last_payment":   row.last_payment,
-    }
+    schema = []
+
+    with engine.connect() as conn:
+        tables_result = conn.execute(
+            __import__("sqlalchemy").text(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name"
+            )
+        )
+
+        table_names = [row[0] for row in tables_result]
+
+        for table_name in table_names:
+            cols_result = conn.execute(  __import__("sqlalchemy").text(f"PRAGMA table_info('{table_name}')") )
+            columns = [
+                {
+                    "name":     row[1],
+                    "type":     row[2],
+                    "not_null": bool(row[3]),
+                    "pk":       bool(row[5]),
+                }
+                for row in cols_result
+            ]
+            schema.append({
+                "table":   table_name,
+                "columns": columns,
+            })
+
+    _schema_cache = schema
+    return schema
 
 
 @lc_tool(
-    "get_invoice_history",
+    "query_database",
     description=(
-        "Retrieve the last 5 invoices for a given account ID. "
-        "Use this when the user asks about past invoices, billing history, "
-        "or wants to see previous charges."
+        "Execute a read-only SELECT query against the billing database and "
+        "return the results as a list of row dicts. "
+        "Rules you must follow:\n"
+        "  - Only SELECT statements are allowed. Never INSERT, UPDATE, DELETE, "
+        "    DROP, ALTER, or any other write/mutation statement.\n"
+        "  - Always call get_tables first if you do not know the schema.\n"
+        "  - Results are capped at 50 rows. If truncated is true in the "
+        "    response, tell the user only partial results are shown.\n"
+        "  - Column names are case-sensitive — use exact names from get_tables.\n"
+        "  - SQLite syntax: use LIKE for pattern matching, strftime() for "
+        "    date formatting, LIMIT for row counts."
     ),
 )
-def get_invoice_history(account_id: str) -> list[dict]:
-    with get_session() as session:
-        rows = session.exec(
-            select(Invoice)
-            .where(Invoice.account_id == account_id)
-            .order_by(Invoice.date.desc())
-            .limit(5)
-        ).all()
-    if not rows:
-        return [{"error": f"No invoices found for account_id '{account_id}'"}]
+def query_database(sql: str) -> dict:
+    ok, reason = _is_select_only(sql)
+    if not ok:
+        return {
+            "error":   reason,
+            "hint":    "Rewrite the query as a SELECT statement.",
+            "sql":     sql,
+        }
 
-    return [
-        {"invoice_id": r.invoice_id, "date": r.date,
-         "amount": r.amount, "status": r.status}
-        for r in rows
-    ]
+    try:
+        import sqlalchemy
 
+        with engine.connect() as conn:
+            result = conn.execute(sqlalchemy.text(sql))
+            columns = list(result.keys())
+            rows    = result.fetchmany(MAX_ROWS + 1)
 
-@lc_tool(
-    "get_payment_methods",
-    description=(
-        "Retrieve the saved payment methods on file for a given account ID. "
-        "Use this when the user asks about their saved cards, bank accounts, "
-        "or wants to know how they can pay."
-    ),
-)
-def get_payment_methods(account_id: str) -> dict:
-    with get_session() as session:
-        rows = session.exec(select(PaymentMethod).where(PaymentMethod.account_id == account_id) ).all()
-    if not rows:
-        return {"error": f"No payment methods found for account_id '{account_id}'"}
+        truncated = len(rows) > MAX_ROWS
+        rows      = rows[:MAX_ROWS]
 
-    methods = []
+        return {
+            "columns":   columns,
+            "rows":      [dict(zip(columns, row)) for row in rows],
+            "row_count": len(rows),
+            "truncated": truncated,
+        }
 
-    for row in rows:
-        entry = {"type": row.type, "last4": row.last4, "default": row.is_default}
-        if row.expiry: entry["expiry"] = row.expiry
-        if row.bank:   entry["bank"]   = row.bank
-        methods.append(entry)
-
-    return {"account_id": account_id, "payment_methods": methods}
-
+    except Exception as exc:
+        # Return the error as data — the LLM can self-correct and retry
+        return {
+            "error": str(exc),
+            "hint":  "Check column names and table names using get_tables.",
+            "sql":   sql,
+        }
 
 _call_complaint_agent_tool = make_agent_call_tool(
     target=AgentType.COMPLAINT,
     description=(
-        "Call the complaint agent to CHECK the status of an existing ticket "
-        "or retrieve a customer's complaint history. "
-        "Use this ONLY when the customer asks about a previous complaint or ticket. "
-        "Do NOT use this to create or stage new tickets."
+        "Call the complaint agent to retrieve existing ticket status or complaint history. "
+        "Use this in two situations: "
+        "(1) The customer directly asks about a previous complaint or ticket during a billing conversation. "
+        "(2) You found a billing anomaly (unexpected charge, duplicate payment, balance spike) "
+        "    AND want to check whether the customer already has an open ticket about it — "
+        "    so you can give them a complete picture without asking them to contact another team. "
+        "Do NOT use this to create or stage new tickets. "
+        "Do NOT call this just because complaints were mentioned in the original user message — "
+        "only call it when YOU need the complaint data to complete your billing response."
     ),
 )
 
-OWN_TOOLS = [get_account_balance, get_invoice_history, get_payment_methods]
-
-llm = get_vertex_llm(temperature=0, role="specialist")
-
+OWN_TOOLS = [get_tables, query_database]
 
 USER_FACING_PROMPT = """You are a helpful and professional billing support agent for a telecommunications company.
 
+DATABASE TOOLS:
+You have two tools to access billing data:
+  - get_tables: call this once to learn the schema (table names and columns).
+  - query_database: write and run any SELECT query to answer the user's question.
+
+Always call get_tables first in a new conversation before writing any query.
+After the first call the schema is in your context — do not call get_tables again.
+
 CONVERSATION BEHAVIOUR:
 1. Greet the user warmly on the first message. On subsequent turns continue naturally.
-2. Before calling any tool, ensure you have the customer's account ID.
-   If missing, politely ask for their name and account number or phone number.
-   Never re-ask for information already given earlier in this conversation.
-3. Use tools to fetch data before answering billing questions.
+2. Before querying, ensure you have the customer's account ID.
+   If missing, politely ask for it. Never re-ask for information already given.
+3. Use query_database to fetch data before answering billing questions.
+   Write precise SQL — filter by account_id, order by date desc, limit rows sensibly.
 4. When you find an anomaly (unexpected charge, balance spike vs prior invoices),
    explain it clearly and ask: "Would you like me to raise a complaint ticket about this?"
 5. When the customer agrees to raise a ticket, say:
    "I've noted your complaint. I'm transferring you to our complaint team now —
    they will confirm the details and raise the ticket for you."
-   Then STOP. Do NOT call any tool. Do NOT try to stage or create the ticket.
-   The system will automatically route the next message to the complaint team.
-6. You can use call_complaint_agent ONLY to look up an existing ticket status or
-   complaint history when the customer asks about a previous complaint.
-   NEVER use it to create or stage new tickets.
-7. Never expose raw tool output or JSON — translate everything into friendly language.
-8. Keep responses concise and focused. Close warmly if the customer says goodbye."""
+   Then STOP. Do NOT call any tool. The system routes the next message automatically.
+6. A2A COLLABORATION — when to call call_complaint_agent:
+   - The customer asks about a previous complaint or ticket during this billing conversation.
+   - You found a billing anomaly AND want to check if an open ticket already exists for it,
+     so you can give the customer a complete picture in one response.
+   In both cases pass the customer_id and a clear task description.
+   NEVER use call_complaint_agent to create tickets.
+   NEVER call it just because the user mentioned complaints in their message —
+   only call it when you genuinely need complaint data to complete your answer.
+7. Never expose raw SQL results or JSON to the user — translate into friendly language.
+8. Close warmly if the customer says goodbye."""
 
 INTERNAL_PROMPT = """You are the billing agent responding to an internal request from another agent.
-Return a concise, factual answer. Do NOT greet. Do NOT add pleasantries.
-Just fetch the data and return the facts.
-Use account_id 'ACC-001' as default if none is specified in the task."""
+Return a concise factual answer. Do NOT greet.
+Use get_tables then query_database to fetch the data.
+Default to account_id 'ACC-001' if none is specified."""
 
 
-def _build_messages(req: A2ARequest) -> list:
-    system_prompt = INTERNAL_PROMPT if req.is_internal else USER_FACING_PROMPT
-    prior         = dicts_to_messages(req.conversation_history)
-
-    if not prior or not isinstance(prior[-1], HumanMessage):
-        prior.append(HumanMessage(content=req.user_message))
-
-    return [SystemMessage(content=system_prompt), *prior]
+llm           = get_vertex_llm(temperature=0, role="specialist")
+_checkpointer = InMemorySaver()   # production: AsyncPostgresSaver
 
 
-def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
+def _build_agent(req: A2ARequest, session_id: str):
     if req.is_internal:
-        tools = OWN_TOOLS
+        tools  = list(OWN_TOOLS)
+        prompt = INTERNAL_PROMPT
     else:
         bound_complaint = bind_inter_agent_args(
             _call_complaint_agent_tool,
@@ -162,29 +244,56 @@ def _build_tool_map(req: A2ARequest, session_id: str) -> dict:
             calling_agent=AgentType.BILLING.value,
             history=req.conversation_history,
         )
-        tools = [*OWN_TOOLS, bound_complaint]
+        tools  = [*OWN_TOOLS, bound_complaint]
+        prompt = USER_FACING_PROMPT
 
-    return {t.name: t for t in tools if hasattr(t, "name") and t.name}
+    return create_agent(
+        llm,
+        tools=tools,
+        system_prompt=prompt,
+        checkpointer=_checkpointer,
+        name="billing",
+    )
 
 
-def _make_llm_with_tools(req: A2ARequest, session_id: str):
-    tool_map = _build_tool_map(req, session_id)
-    tools    = list(tool_map.values())
-    return llm.bind_tools(tools), tool_map
+def _build_messages(req: A2ARequest) -> list[dict]:
+    msgs = []
+    for d in req.conversation_history:
+        t = d.get("type", "")
+        if t == "human":
+            msgs.append({"role": "user",      "content": d.get("content", "")})
+        elif t == "ai":
+            msgs.append({"role": "assistant", "content": d.get("content", "")})
+        elif t == "tool":
+            msgs.append({"role": "tool",      "content": d.get("content", ""),"name": d.get("name", ""), "tool_call_id": d.get("tool_call_id", "")})
+
+    last_is_user = (
+        msgs and
+        msgs[-1]["role"] == "user" and
+        msgs[-1]["content"] == req.user_message
+    )
+
+    if not last_is_user:
+        msgs.append({"role": "user", "content": req.user_message})
+
+    return msgs
 
 
 async def stream_billing_agent(req: A2ARequest) -> AsyncIterator[str]:
     session_id = req.context.get("session_id", req.request_id)
 
-    trace_emitter.emit(session_id, "agent_start", agent="billing", is_internal=req.is_internal, triggered_by=req.calling_agent or "orchestrator")
+    trace_emitter.emit(
+        session_id, "agent_start", agent="billing",
+        is_internal=req.is_internal,
+        triggered_by=req.calling_agent or "orchestrator",
+    )
 
-    messages              = _build_messages(req)
-    llm_with_tools, tool_map = _make_llm_with_tools(req, session_id)
+    agent    = _build_agent(req, session_id)
+    messages = _build_messages(req)
 
-    async for chunk in run_agent_loop(
-        llm_with_tools=llm_with_tools,
+    async for chunk in stream_agent_events(
+        agent=agent,
         messages=messages,
-        tool_map=tool_map,
         agent_name="billing",
         session_id=session_id,
         is_internal=req.is_internal,
@@ -192,7 +301,7 @@ async def stream_billing_agent(req: A2ARequest) -> AsyncIterator[str]:
         yield chunk
 
 
-app = FastAPI(title="Billing Agent", version="4.0")
+app = FastAPI(title="Billing Agent", version="5.0")
 
 
 @app.on_event("startup")
@@ -212,22 +321,9 @@ async def process_stream(req: A2ARequest) -> StreamingResponse:
 @app.post("/process", response_model=A2AResponse)
 async def process(req: A2ARequest) -> A2AResponse:
     session_id = req.context.get("session_id", req.request_id)
-
-    trace_emitter.emit(session_id, "agent_start", agent="billing", is_internal=req.is_internal,triggered_by=req.calling_agent or "orchestrator")
-
-    messages              = _build_messages(req)
-    llm_with_tools, tool_map = _make_llm_with_tools(req, session_id)
-
     final_text = ""
 
-    async for raw in run_agent_loop(
-        llm_with_tools=llm_with_tools,
-        messages=messages,
-        tool_map=tool_map,
-        agent_name="billing",
-        session_id=session_id,
-        is_internal=req.is_internal,
-    ):
+    async for raw in stream_billing_agent(req):
         for line in raw.splitlines():
             line = line.strip()
             if not line.startswith("data:"):
@@ -236,7 +332,6 @@ async def process(req: A2ARequest) -> A2AResponse:
                 payload = json.loads(line[5:].strip())
                 if payload.get("text"):
                     final_text += payload["text"]
-
             except json.JSONDecodeError:
                 pass
 
@@ -255,5 +350,9 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run("billing_agent.main:app", host="0.0.0.0",
-                port=BILLING_AGENT_PORT, reload=True)
+    uvicorn.run(
+        "billing_agent.main:app",
+        host="0.0.0.0",
+        port=BILLING_AGENT_PORT,
+        reload=True,
+    )

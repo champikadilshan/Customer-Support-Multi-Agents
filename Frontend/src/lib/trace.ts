@@ -55,13 +55,26 @@ export function mapTraceAgent(agent: string | undefined): AgentNodeId | null {
   return mapAgentValue(agent)
 }
 
+const SPECIALIST_AGENTS: AgentNodeId[] = ["billing", "complaint", "sales"]
+
 /** Nodes that should flash success then return to idle after a transient event. */
-export function getFlashResetTargets(event: TraceEvent): AgentNodeId[] {
+export function getFlashResetTargets(
+  event: TraceEvent,
+  state?: AgentGraphState
+): AgentNodeId[] {
   const targets = new Set<AgentNodeId>()
 
   if (event.type === "agent_end" && event.status === "success") {
     const agentId = mapTraceAgent(event.agent)
     if (agentId) targets.add(agentId)
+
+    if (
+      agentId &&
+      SPECIALIST_AGENTS.includes(agentId) &&
+      !event.is_internal
+    ) {
+      targets.add("intent_detector")
+    }
   }
 
   if (event.type === "tool_end" && event.tool) {
@@ -70,6 +83,13 @@ export function getFlashResetTargets(event: TraceEvent): AgentNodeId[] {
       for (const nodeId of config.nodes) {
         targets.add(nodeId)
       }
+    }
+
+    if (
+      event.tool === "create_ticket" &&
+      state?.createTicketPhase === "post_resume"
+    ) {
+      targets.add("ticket_db")
     }
   }
 
@@ -181,10 +201,22 @@ function completeToolInfra(state: AgentGraphState, tool: string): AgentGraphStat
     next = setEdge(next, from, to, "completed")
   }
 
+  if (tool === "create_ticket" && state.createTicketPhase === "post_resume") {
+    next = setNode(next, "ticket_db", "completed", "Saving ticket")
+    next = setEdge(next, "ticket_api", "ticket_db", "completed")
+    next = { ...next, createTicketPhase: "none" }
+  }
+
   return next
 }
 
-const SPECIALIST_AGENTS: AgentNodeId[] = ["billing", "complaint", "sales"]
+function deactivateTicketPipeline(state: AgentGraphState): AgentGraphState {
+  let next = setNode(state, "ticket_api", "idle")
+  next = setNode(next, "ticket_db", "idle")
+  next = setEdge(next, "complaint", "ticket_api", "idle")
+  next = setEdge(next, "ticket_api", "ticket_db", "idle")
+  return next
+}
 
 function isOrchestratorRef(agent: string | undefined): boolean {
   if (!agent) return false
@@ -229,6 +261,51 @@ function getActiveHandoffParent(
     return fromId
   }
   return null
+}
+
+/** Idle specialists not involved in the current orchestrator dispatch. */
+function idleInactiveSpecialists(
+  state: AgentGraphState,
+  activeSpecialist: AgentNodeId
+): AgentGraphState {
+  let next: AgentGraphState = { ...state, handoffs: [] }
+
+  for (const id of SPECIALIST_AGENTS) {
+    if (id === activeSpecialist) continue
+
+    next = setNode(next, id, "idle", undefined, {
+      runningTools: [],
+      completedTools: [],
+    })
+    next = setEdge(next, "intent_detector", id, "idle")
+
+    for (const other of SPECIALIST_AGENTS) {
+      if (other !== id) {
+        next = setEdge(next, id, other, "idle")
+      }
+    }
+
+    if (id === "billing") {
+      next = setNode(next, "billing_db", "idle")
+      next = setEdge(next, "billing", "billing_db", "idle")
+    }
+  }
+
+  return next
+}
+
+function hasStaleTurnState(state: AgentGraphState): boolean {
+  if (state.routedAgent !== null || state.handoffs.length > 0) return true
+  return SPECIALIST_AGENTS.some((id) => state.nodes[id].status !== "idle")
+}
+
+export function isNewUserTurnEvent(event: TraceEvent): boolean {
+  if (event.type === "orchestrator_dispatch") return true
+  return (
+    event.type === "agent_start" &&
+    !event.is_internal &&
+    (event.agent === "orchestrator" || event.agent === "intent_detector")
+  )
 }
 
 function activatePrimaryRoute(
@@ -323,21 +400,45 @@ export function reduceAgentGraphOnTraceEvent(
     }
 
     case "agent_start": {
+      // New user message — reset stale graph when orchestrator_dispatch was missed.
+      if (
+        !event.is_internal &&
+        (event.agent === "orchestrator" || event.agent === "intent_detector")
+      ) {
+        if (hasStaleTurnState(next)) {
+          next = resetTurnState(next)
+        }
+        if (next.nodes.intent_detector.status !== "active") {
+          next = setNode(next, "intent_detector", "active", "Processing request...")
+        }
+        break
+      }
+
       const agentId = mapTraceAgent(event.agent)
       if (!agentId || agentId === "intent_detector") break
+
+      if (event.triggered_by === "hitl_resume") {
+        next = setNode(next, agentId, "active", "Resuming after approval", {
+          runningTools: [],
+          completedTools: next.nodes[agentId].completedTools,
+        })
+        next = setNode(next, "hitl", "idle")
+        next = setEdge(next, "complaint", "hitl", "idle")
+        next = { ...next, createTicketPhase: "post_resume" }
+        break
+      }
 
       const parentId = mapTraceAgent(event.triggered_by)
       const handoffParent = getActiveHandoffParent(next, agentId)
       const isSubAgentCall =
         isSubAgentTriggered(event) || handoffParent != null
 
-      // Backend may emit a second agent_start with triggered_by=orchestrator
-      // after an A2A handoff already activated this node.
+      // Already RUNNING from agent_handoff — no visual change needed.
       if (
-        handoffParent &&
-        !isSubAgentTriggered(event) &&
-        next.nodes[agentId].status === "active" &&
-        next.nodes[agentId].detail?.includes("Internal call")
+        !isSubAgentCall &&
+        next.routedAgent === agentId &&
+        (next.nodes[agentId].status === "active" ||
+          next.nodes[agentId].status === "waiting")
       ) {
         break
       }
@@ -391,6 +492,7 @@ export function reduceAgentGraphOnTraceEvent(
       if (!agentId) break
 
       if (event.status === "hitl_suspended") {
+        // Not a completion — keep WAITING nodes set by hitl_requested.
         next = setNode(next, agentId, "waiting", "Awaiting human input", {
           runningTools: [],
           completedTools: next.nodes[agentId].completedTools,
@@ -398,12 +500,22 @@ export function reduceAgentGraphOnTraceEvent(
         if (agentId === "complaint") {
           next = setNode(next, "hitl", "waiting", "Awaiting human input")
           next = setEdge(next, "complaint", "hitl", "active")
+          next = deactivateTicketPipeline(next)
         }
-      } else if (event.status === "success") {
+        break
+      }
+
+      if (event.status === "success") {
         next = setNode(next, agentId, "completed", "Done", {
           runningTools: [],
           completedTools: next.nodes[agentId].completedTools,
         })
+
+        if (agentId === "complaint" && next.createTicketPhase === "post_resume") {
+          next = setNode(next, "hitl", "idle")
+          next = setEdge(next, "complaint", "hitl", "idle")
+          next = { ...next, createTicketPhase: "none" }
+        }
       } else {
         next = setNode(next, agentId, "error", event.message ?? "Failed", {
           runningTools: [],
@@ -411,24 +523,40 @@ export function reduceAgentGraphOnTraceEvent(
         })
       }
 
-      const subAgentCall = isSubAgentTriggered(event)
+      const subAgentCall = event.is_internal === true
 
-      if (subAgentCall && event.triggered_by) {
-        next = upsertHandoff(
-          next,
-          event.triggered_by,
-          event.agent ?? "unknown",
-          "completed"
-        )
-        const callerId = mapTraceAgent(event.triggered_by)
-        if (callerId) {
-          next = setEdge(next, callerId, agentId, "completed")
-          next = setNode(next, callerId, "active", "Resuming...")
+      if (subAgentCall) {
+        next = setNode(next, agentId, "idle", undefined, {
+          runningTools: [],
+          completedTools: next.nodes[agentId].completedTools,
+        })
+        if (event.triggered_by) {
+          next = upsertHandoff(
+            next,
+            event.triggered_by,
+            event.agent ?? "unknown",
+            "completed"
+          )
+          const callerId = mapTraceAgent(event.triggered_by)
+          if (callerId) {
+            next = setEdge(next, callerId, agentId, "completed")
+            next = setNode(next, callerId, "active", "Resuming...")
+          }
         }
+        break
       }
 
-      if (next.routedAgent === agentId && !subAgentCall) {
+      if (
+        event.status === "success" &&
+        next.routedAgent === agentId &&
+        SPECIALIST_AGENTS.includes(agentId)
+      ) {
+        next = setNode(next, "intent_detector", "completed", "Done")
         next = setEdge(next, "intent_detector", agentId, "completed")
+      }
+
+      if (agentId === "intent_detector" && event.status === "success") {
+        next = setNode(next, "intent_detector", "completed", "Done")
       }
       break
     }
@@ -451,35 +579,27 @@ export function reduceAgentGraphOnTraceEvent(
         next = setEdge(next, fromId, toId, "active")
 
         if (toId !== "intent_detector") {
-          next = setNode(
-            next,
-            toId,
-            "active",
-            event.reason ?? "Handoff in progress..."
-          )
+          const toDetail = fromOrchestrator
+            ? event.reason ?? "Handoff in progress..."
+            : `Internal call from ${event.from_agent ?? "agent"}`
+
+          next = setNode(next, toId, "active", toDetail)
 
           if (fromOrchestrator) {
+            next = idleInactiveSpecialists(next, toId)
             next = { ...next, routedAgent: toId }
             next = ensureOrchestratorRouteTo(next, toId, "active")
-          }
-        }
-
-        if (fromOrchestrator) {
-          next = setNode(
-            next,
-            fromId,
-            "active",
-            `Dispatching to ${event.to_agent}...`
-          )
-        } else if (fromId) {
-          next = setNode(
-            next,
-            fromId,
-            "active",
-            `Waiting on ${event.to_agent ?? "agent"}...`
-          )
-          if (next.routedAgent && toId !== next.routedAgent) {
-            next = setEdge(next, "intent_detector", toId, "idle")
+            next = setNode(next, fromId, "idle")
+          } else if (fromId) {
+            next = setNode(
+              next,
+              fromId,
+              "active",
+              `Waiting on ${event.to_agent ?? "agent"}...`
+            )
+            if (next.routedAgent && toId !== next.routedAgent) {
+              next = setEdge(next, "intent_detector", toId, "idle")
+            }
           }
         }
       }
@@ -491,6 +611,10 @@ export function reduceAgentGraphOnTraceEvent(
       if (!agentId || !event.tool) break
 
       next = markToolRunning(next, agentId, event.tool)
+
+      if (event.tool === "create_ticket") {
+        next = { ...next, createTicketPhase: next.createTicketPhase === "post_resume" ? "post_resume" : "pre_hitl" }
+      }
 
       if (isInterAgentTool(event.tool)) {
         const target = INTER_AGENT_TOOL_TARGETS[event.tool]
@@ -521,28 +645,19 @@ export function reduceAgentGraphOnTraceEvent(
     }
 
     case "hitl_requested":
-      next = setNode(next, "complaint", "waiting", "Awaiting approval")
-      next = setNode(next, "hitl", "waiting", "Awaiting approval")
+      next = deactivateTicketPipeline(next)
+      next = setNode(next, "complaint", "waiting", "Awaiting human input", {
+        runningTools: [],
+        completedTools: next.nodes.complaint.completedTools,
+      })
+      next = setNode(next, "hitl", "waiting", "Awaiting human input")
       next = setEdge(next, "complaint", "hitl", "active")
+      next = { ...next, createTicketPhase: "pre_hitl" }
       break
 
-    case "hitl_resumed": {
-      const approved =
-        event.response?.toLowerCase().includes("yes") ||
-        event.response?.toLowerCase().includes("approve")
-
-      next = setNode(next, "complaint", "active", "Resuming after approval")
-      next = setNode(next, "hitl", "completed", approved ? "Approved" : "Declined")
-      next = setEdge(next, "complaint", "hitl", "completed")
-
-      if (approved) {
-        next = setNode(next, "ticket_api", "active", "Creating ticket...")
-        next = setNode(next, "ticket_db", "active", "Persisting ticket...")
-        next = setEdge(next, "complaint", "ticket_api", "active")
-        next = setEdge(next, "ticket_api", "ticket_db", "active")
-      }
+    case "hitl_resumed":
+      // Visual state is driven by agent_start(triggered_by=hitl_resume), not this event.
       break
-    }
 
     case "error": {
       const agentId = mapTraceAgent(event.agent) ?? next.routedAgent ?? "intent_detector"

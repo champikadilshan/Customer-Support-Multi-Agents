@@ -48,14 +48,14 @@ function healthDotClass(health?: HealthStatus) {
   }
 }
 
-function statusLabel(status: NodeStatus) {
+function statusLabel(status: NodeStatus, detail?: string) {
   switch (status) {
     case "active":
-      return "Running"
+      return detail?.includes("Internal call") ? "Internal" : "Running"
     case "completed":
       return "Done"
     case "waiting":
-      return "Waiting"
+      return "Input"
     case "error":
       return "Error"
     default:
@@ -83,6 +83,7 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
   const meta = AGENT_NODES[data.nodeId]
   const Icon = NODE_ICONS[data.nodeId]
   const isActive = data.status === "active" || data.status === "waiting"
+  const isInternalCall = data.detail?.includes("Internal call") ?? false
   const isInfra = data.kind === "infra"
   const detailText = data.runningTool
     ? formatToolLabel(data.runningTool)
@@ -94,22 +95,24 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
 
       <div
         className={cn(
-          "relative flex h-full min-w-0 flex-col overflow-hidden rounded-xl border bg-background px-3 py-2.5 shadow-sm transition-all duration-500",
+          "relative flex h-full min-w-0 flex-col overflow-hidden rounded-xl border border-foreground/20 bg-background px-3 py-2.5 shadow-sm transition-[border-color,background-color,box-shadow,opacity,transform] duration-700 ease-in-out",
           data.highlighted &&
             "ring-2 ring-sky-500/70 ring-offset-1 ring-offset-background",
           isInfra && "rounded-lg bg-muted/30",
           data.status === "active" &&
             (isInfra
-              ? "border-emerald-600/50 dark:border-emerald-400/40"
-              : "border-foreground shadow-[0_0_0_1px_hsl(var(--foreground)/0.08),0_8px_24px_-10px_hsl(var(--foreground)/0.3)]"),
+              ? "border-emerald-600/70 dark:border-emerald-400/60"
+              : isInternalCall
+                ? "border-dashed border-orange-500/75 bg-orange-50/30 dark:bg-orange-950/10"
+                : "border-foreground/80 shadow-[0_0_0_1px_hsl(var(--foreground)/0.12),0_8px_24px_-10px_hsl(var(--foreground)/0.3)]"),
           data.status === "completed" &&
             (isInfra
-              ? "border-emerald-600/25 bg-emerald-50/50 dark:bg-emerald-950/15"
-              : "border-foreground/25 bg-muted/40"),
+              ? "border-emerald-600/45 bg-emerald-50/50 opacity-90 dark:border-emerald-400/35 dark:bg-emerald-950/15"
+              : "border-foreground/40 bg-muted/40 opacity-90"),
           data.status === "waiting" &&
-            "border-amber-500/60 bg-amber-50/80 dark:bg-amber-950/20",
-          data.status === "error" && "border-destructive/60 bg-destructive/5",
-          data.status === "idle" && "border-border/80"
+            "animate-pulse border-amber-500/75 bg-amber-50/80 dark:bg-amber-950/20",
+          data.status === "error" && "border-destructive/75 bg-destructive/5",
+          data.status === "idle" && "border-foreground/30"
         )}
       >
         {isActive ? (
@@ -146,9 +149,9 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
               isInfra ? "h-8 w-8" : "h-9 w-9",
               isActive
                 ? isInfra
-                  ? "border-emerald-600/25 bg-emerald-600 text-white dark:border-emerald-400/25 dark:bg-emerald-500"
-                  : "border-foreground/20 bg-foreground text-background"
-                : "border-border bg-muted/50 text-muted-foreground"
+                  ? "border-emerald-600/40 bg-emerald-600 text-white dark:border-emerald-400/35 dark:bg-emerald-500"
+                  : "border-foreground/30 bg-foreground text-background"
+                : "border-foreground/25 bg-muted/50 text-muted-foreground"
             )}
           >
             <Icon className={cn(isInfra ? "h-4 w-4" : "h-5 w-5")} />
@@ -170,7 +173,9 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
                   data.status === "active" &&
                     (isInfra
                       ? "bg-emerald-600 text-white dark:bg-emerald-500"
-                      : "bg-foreground text-background"),
+                      : isInternalCall
+                        ? "bg-orange-500/15 text-orange-700 dark:text-orange-300"
+                        : "bg-foreground text-background"),
                   data.status === "completed" && "bg-muted text-foreground",
                   data.status === "waiting" &&
                     "bg-amber-500/15 text-amber-700 dark:text-amber-300",
@@ -178,7 +183,7 @@ function AgentFlowNodeComponent({ data }: NodeProps<Node<AgentFlowNodeData>>) {
                   data.status === "idle" && "bg-muted text-muted-foreground"
                 )}
               >
-                {statusLabel(data.status)}
+                {statusLabel(data.status, data.detail)}
               </span>
             </div>
             <p className="mt-1 line-clamp-2 overflow-hidden break-words text-[11px] leading-snug text-muted-foreground">

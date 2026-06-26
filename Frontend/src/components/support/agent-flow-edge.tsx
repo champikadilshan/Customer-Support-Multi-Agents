@@ -146,7 +146,7 @@ function TraceEdgeComponent({
   const dashOffset = isCollab ? "-28" : "-36"
 
   return (
-    <g opacity={opacity}>
+    <g opacity={opacity} className="transition-opacity duration-700 ease-in-out">
       {paths.map((segment) => (
         <path
           key={`${id}-${segment.key}`}
@@ -156,7 +156,7 @@ function TraceEdgeComponent({
           strokeWidth={isActive ? (isCollab ? 2.5 : 3) : isCollab ? 1.75 : 2}
           strokeDasharray={isActive ? activeDasharray : idleDasharray}
           strokeLinecap="round"
-          className="transition-[stroke,stroke-width,opacity] duration-300 ease-out"
+          className="transition-[stroke,stroke-width,opacity] duration-700 ease-in-out"
         >
           {isActive ? (
             <animate
